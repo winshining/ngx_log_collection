@@ -1,0 +1,1 @@
+curl -v -H "Client-UUID: c20aff8a-c457-42b1-a096-3016a89493a7" -d "content=This+is+a+test+http+client+request+body. Following+data+is+garbage%3A+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" http://localhost/log_collection

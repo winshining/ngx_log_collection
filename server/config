@@ -1,0 +1,18 @@
+# This is the first way to compile the thirdpart code into nginx
+# Before execute configure script, add parameter --add-module=PATH
+# PATH is where our thirdpart code and this file located
+# PATH <--> $ngx_addon_dir
+ngx_addon_name=ngx_http_log_collection_module
+HTTP_MODULES="$HTTP_MODULES ngx_http_log_collection_module"
+NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_log_collection_module.c"
+
+# NOTE: HTTP filter module uses variable HTTP_FILTER_MODULES other
+# than HTTP_MODULES. In fact, there are other modules which can be
+# redefined, they are: $CORE_MODULES, $EVENT_MODULES, $HTTP_MODULES,
+# $HTTP_HEADERS_FILTER_MODULES. They respectively correspond to nginx
+# core modules, event modules, http modules and http headers filter
+# modules.
+# When the given way doesn't meet your needs, you can directly modify
+# the Makefile (objs/Makefile) and the code file (objs/ngx_modules.c).
+# NOTE: this method is only useful when you want to modify the modules
+# order in ngx_modules.c and be careful, that is ERROR-PRONE!
