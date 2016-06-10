@@ -39,7 +39,10 @@
  * Version 2.0:
  * Add compatibility for versions above 1.3.9.
  * Code on 2016-03-28.
- */
+ * 
+ * Fix a bug: initialize rc = NGX_OK in ngx_http_log_collection_post_handler.
+ * Code on 2016-06-10.
+ /
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
@@ -1780,7 +1783,7 @@ ngx_http_log_collection_process_request_body(ngx_http_request_t *r, ngx_chain_t 
 static void
 ngx_http_log_collection_post_handler(ngx_http_request_t *r)
 {
-	ngx_int_t rc;
+	ngx_int_t rc = NGX_OK;
 	ngx_buf_t *b;
 	ngx_chain_t out;
 	ngx_http_log_collection_ctx_t *ctx = ngx_http_get_module_ctx(r,
