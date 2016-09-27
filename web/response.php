@@ -1,13 +1,4 @@
 <?php
-$i = 0;
-$mod = 2;
-?>
-<html>
-<head>
-<title>Test log collection</title>
-</head>
-<body>
-<?
 if ($_POST) {
     echo "<table border=\"2\" cellpadding=\"2\">";
 
@@ -18,10 +9,8 @@ if ($_POST) {
 	}
 
     echo "</table>";
-} else {?>
-	<h2>No data found</h2>
-<?}
+} else {
+	echo "<h2>No data found</h2>";
+}
 ?>
-</body>
-</html>
 

@@ -42,7 +42,7 @@
  * 
  * Fix a bug: initialize rc = NGX_OK in ngx_http_log_collection_post_handler.
  * Code on 2016-06-10.
- /
+ */
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
@@ -1365,7 +1365,7 @@ ngx_http_log_collection_flush_to_file(ngx_http_log_collection_ctx_t *ctx)
 	ngx_http_log_collection_loc_conf_t	*lclcf;
 	off_t								len;
 	u_char								*buf;
-	size_t								rest;
+	size_t								rest = 0;
 	ngx_int_t							rc  = NGX_OK;
 	ngx_flag_t							max = 0;
 

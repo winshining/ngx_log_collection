@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<title>log collection</title>
+		<style>
+			.label {
+				display: none;
+			}
+		</style>
+		<script type="text/javascript" src="js/jquery-2.2.1.min.js"></script>
+		<script type="text/javascript">
+			$(document).ready(function() {
+				$("#test1").css("resize", "none");
+				$("#test2").css("resize", "none");
+
+				$("#submit").on("click", function() {
+					$("#status").html("");
+					$("#content").html("");
+
+					$.ajax({
+						type: "post",
+						url: "/log_collection",
+						data: $("#testform").serialize(),
+						headers: { "Client-UUID": "c20aff8a-c457-42b1-a096-3016a89493a7" },
+						// beforeSend: function(xmlHttpRequest) {
+						//	xmlHttpRequest.setRequestHeader("Client-UUID", "c20aff8a-c457-42b1-a096-3016a89493a7");
+						// },
+						success: function(result) {
+							console.log(result);
+							$("#status").html("log upload succeeded.");
+							$(".label").show();
+							$("#content").html(result);
+						},
+						error: function(xmlHttpRequest, textstatus, errorThrown) {
+							console.log(xmlHttpRequest);
+							console.log(textstatus);
+							console.log(errorThrown);
+							$("#status").html("log upload failed.");
+							$(".label").show();
+							$("#content").html(errorThrown);
+						}
+					});
+				});
+			});
+		</script>
+	</head>
+	<body>
+		<!--form id="testform" enctype="application/x-www-form-urlencoded" action="/log_collection" method="post"-->
+		<form id="testform" enctype="application/x-www-form-urlencoded" onsubmit="return false;" method="post">
+			<!--input type="text" id="test" name="content" /-->
+			<textarea cols="60" rows="15" id="test1" name="content1"></textarea>
+			<textarea cols="60" rows="15" id="test2" name="content2"></textarea>
+		</form>
+		<input type="submit" id="submit" value="send" />
+		<h2 id="status"></h2>
+                <h2 class="label">details as follow:</h2>
+		<div id="content"></div>
+	</body>
+</html>
