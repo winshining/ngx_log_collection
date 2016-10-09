@@ -42,6 +42,14 @@
  * 
  * Fix a bug: initialize rc = NGX_OK in ngx_http_log_collection_post_handler.
  * Code on 2016-06-10.
+ *
+ * Fix a bug: initialize rest = 0 in ngx_http_log_collection_flush_to_file.
+ * Code on 2016-09-26.
+ *
+ * Version 2.1:
+ * Recode body reading functionality,
+ * refering to https://github.com/hongzhidao/nginx-upload-module, many thanks.
+ * Code on 2016-10-09.
  */
 #include <ngx_config.h>
 #include <ngx_core.h>
@@ -190,16 +198,11 @@ typedef struct ngx_http_log_collection_ctx_s {
 //	ngx_string(NGX_HTTP_CLIENT_TEMP_PATH), { 1, 0, 0 }
 // };
 
-#if defined nginx_version && nginx_version >= 1003009
-static void ngx_http_read_log_collection_request_body_handler_compatible(ngx_http_request_t *r);
-static ngx_int_t ngx_http_do_read_log_collection_client_request_body_compatible(ngx_http_request_t *r);
-
-static ngx_int_t ngx_http_log_collection_write_request_body(ngx_http_request_t *r);
-static ngx_int_t ngx_http_log_collection_body_filter(ngx_http_request_t *r, ngx_chain_t *in);
+static ngx_int_t ngx_http_log_collection_process_request_body(ngx_http_request_t *r, ngx_chain_t *body);
+static ngx_int_t ngx_http_log_collection_request_body_filter(ngx_http_request_t *r, ngx_chain_t *in);
 
 static ngx_int_t ngx_http_log_collection_request_body_length_filter(ngx_http_request_t *r, ngx_chain_t *in);
 static ngx_int_t ngx_http_log_collection_request_body_chunked_filter(ngx_http_request_t *r, ngx_chain_t *in);
-#endif
 
 static char *ngx_http_log_collection(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void *ngx_http_log_collection_create_loc_conf(ngx_conf_t *cf);
@@ -358,258 +361,8 @@ ngx_module_t ngx_http_log_collection_module = {
 	NGX_MODULE_V1_PADDING
 };
 
-#if defined nginx_version && nginx_version >= 1003009
-void
-ngx_http_read_log_collection_request_body_handler_compatible(ngx_http_request_t *r)
-{
-	ngx_int_t		rc;
-	ngx_event_t		*rev = r->connection->read;
-
-	if (rev->timedout) {
-		r->connection->timedout = 1;
-		ngx_http_finalize_request(r, NGX_HTTP_REQUEST_TIME_OUT);
-		return;
-	}
-
-	rc = ngx_http_do_read_log_collection_client_request_body_compatible(r);
-
-	if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
-		ngx_http_finalize_request(r, rc);
-	}
-}
-
 ngx_int_t
-ngx_http_do_read_log_collection_client_request_body_compatible(ngx_http_request_t *r)
-{
-	off_t						rest;
-	size_t						size;
-	ssize_t						n;
-	ngx_int_t					rc;
-	ngx_buf_t					*b;
-	ngx_chain_t					*cl, out;
-	ngx_connection_t			*c;
-	ngx_http_request_body_t		*rb;
-	ngx_http_core_loc_conf_t	*clcf;
-
-	c = r->connection;
-	rb = r->request_body;
-
-	ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
-				"http read client request body");
-
-	for ( ;; ) {
-		for ( ;; ) {
-			if (rb->buf->last == rb->buf->end) {
-				/* pass buffer to request body filter chain */
-				out.buf = rb->buf;
-				out.next = NULL;
-
-				rc = ngx_http_log_collection_body_filter(r, &out);
-
-				if (rc != NGX_OK) {
-					return rc;
-				}
-
-				/* write to file */
-				if (ngx_http_log_collection_write_request_body(r) != NGX_OK) {
-					return NGX_HTTP_INTERNAL_SERVER_ERROR;
-				}
-
-				/* update chains */
-				rc = ngx_http_log_collection_body_filter(r, NULL);
-				if (rc != NGX_OK) {
-					return rc;
-				}
-
-				if (rb->busy != NULL) {
-					return NGX_HTTP_INTERNAL_SERVER_ERROR;
-				}
-
-				rb->buf->pos = rb->buf->start;
-				rb->buf->last = rb->buf->start;
-			}
-
-			size = rb->buf->end - rb->buf->last;
-			rest = rb->rest - (rb->buf->last - rb->buf->pos);
-
-			if ((off_t) size > rest) {
-				size = (size_t) rest;
-			}
-
-			n = c->recv(c, rb->buf->last, size);
-
-			ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
-					"http client request body recv %z", n);
-
-			if (n == NGX_AGAIN) {
-				break;
-			}
-
-			if (n == 0) {
-				ngx_log_error(NGX_LOG_INFO, c->log, 0,
-					"client prematurely closed connection");
-			}
-
-			if (n == 0 || n == NGX_ERROR) {
-				c->error = 1;
-				return NGX_HTTP_BAD_REQUEST;
-			}
-
-			rb->buf->last += n;
-			r->request_length += n;
-
-			if (n == rest) {
-				/* pass buffer to request body filter chain */
-
-				out.buf = rb->buf;
-				out.next = NULL;
-
-				rc = ngx_http_log_collection_body_filter(r, &out);
-
-				if (rc != NGX_OK) {
-					return rc;
-				}
-			}
-
-			if (rb->rest == 0) {
-				break;
-			}
-
-			if (rb->buf->last < rb->buf->end) {
-				break;
-			}
-		}
-
-		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
-					"http client request body rest %O", rb->rest);
-		if (rb->rest == 0) {
-			break;
-		}
-
-		if (!c->read->ready) {
-			clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
-			ngx_add_timer(c->read, clcf->client_body_timeout);
-
-			if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-				return NGX_HTTP_INTERNAL_SERVER_ERROR;
-			}
-
-			return NGX_AGAIN;
-		}
-	}
-
-	if (c->read->timer_set) {
-		ngx_del_timer(c->read);
-	}
-
-	if (rb->temp_file || r->request_body_in_file_only) {
-		/* save the last part */
-		
-		if (ngx_http_log_collection_write_request_body(r) != NGX_OK) {
-			return NGX_HTTP_INTERNAL_SERVER_ERROR;
-		}
-
-		cl = ngx_chain_get_free_buf(r->pool, &rb->free);
-		if (cl == NULL) {
-			return NGX_HTTP_INTERNAL_SERVER_ERROR;
-		}
-
-		b = cl->buf;
-
-		ngx_memzero(b, sizeof(ngx_buf_t));
-
-		b->in_file = 1;
-		b->file_last = rb->temp_file->file.offset;
-		b->file = &rb->temp_file->file;
-
-		rb->bufs = cl;
-	}
-
-	r->read_event_handler = ngx_http_block_reading;
-
-	rb->post_handler(r);
-
-	return NGX_OK;
-}
-
-ngx_int_t
-ngx_http_log_collection_write_request_body(ngx_http_request_t *r)
-{
-	ssize_t						n;
-	ngx_chain_t					*cl;
-	ngx_temp_file_t				*tf;
-	ngx_http_request_body_t		*rb;
-	ngx_http_core_loc_conf_t	*clcf;
-
-	rb = r->request_body;
-
-	ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-				"http write client request body, bufs %p", rb->bufs);
-
-	if (rb->temp_file == NULL) {
-		tf = ngx_pcalloc(r->pool, sizeof(ngx_temp_file_t));
-		if (tf == NULL) {
-			return NGX_ERROR;
-		}
-
-		clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
-
-		tf->file.fd = NGX_INVALID_FILE;
-		tf->file.log = r->connection->log;
-		tf->path = clcf->client_body_temp_path;
-		tf->pool = r->pool;
-		tf->warn = "a client request body is buffered to a temporary file";
-		tf->log_level = r->request_body_file_log_level;
-		tf->persistent = r->request_body_in_persistent_file;
-		tf->clean = r->request_body_in_clean_file;
-
-		if (r->request_body_file_group_access) {
-			tf->access = 0660;
-		}
-
-		rb->temp_file = tf;
-
-		if (rb->bufs == NULL) {
-			/* empty body with r->request_body_in_file_only */
-
-			if (ngx_create_temp_file(&tf->file, tf->path, tf->pool,
-							tf->persistent, tf->clean, tf->access)
-				!= NGX_OK)
-			{
-				return NGX_ERROR;
-			}
-
-			return NGX_OK;
-		}
-	}
-
-	if (rb->bufs == NULL) {
-		return NGX_OK;
-	}
-
-	n = ngx_write_chain_to_temp_file(rb->temp_file, rb->bufs);
-
-	/* TODO: n == 0 or not complete and level event */
-
-	if (n == NGX_ERROR) {
-		return NGX_ERROR;
-	}
-
-	rb->temp_file->offset += n;
-
-	/* mark all buffers as written */
-
-	for (cl = rb->bufs; cl; cl = cl->next) {
-		cl->buf->pos = cl->buf->last;
-	}
-
-	rb->bufs = NULL;
-
-	return NGX_OK;
-}
-
-ngx_int_t
-ngx_http_log_collection_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
+ngx_http_log_collection_request_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
 	if (r->headers_in.chunked) {
 		return ngx_http_log_collection_request_body_chunked_filter(r, in);
@@ -639,6 +392,10 @@ ngx_http_log_collection_request_body_length_filter(ngx_http_request_t *r, ngx_ch
 	ll = &out;
 
 	for (cl = in; cl; cl = cl->next) {
+		if (rb->rest == 0) {
+			break;
+		}
+
 		tl = ngx_chain_get_free_buf(r->pool, &rb->free);
 		if (tl == NULL) {
 			return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -661,7 +418,7 @@ ngx_http_log_collection_request_body_length_filter(ngx_http_request_t *r, ngx_ch
 		    cl->buf->pos = cl->buf->last;
 			rb->rest -= size;
 		} else {
-		    cl->buf->pos += rb->rest;
+		    cl->buf->pos += (size_t) rb->rest;
 			rb->rest = 0;
 		    b->last = cl->buf->pos;
 		    b->last_buf = 1;
@@ -671,11 +428,11 @@ ngx_http_log_collection_request_body_length_filter(ngx_http_request_t *r, ngx_ch
 		ll = &tl->next;
 	}
 
-	rc = ngx_http_request_body_save_filter(r, out);
+	rc = ngx_http_log_collection_process_request_body(r, out);
 
 	ngx_chain_update_chains(r->pool, &rb->free, &rb->busy, &out,
 				(ngx_buf_tag_t) &ngx_http_read_client_request_body);
-	
+
 	return rc;
 }
 
@@ -808,13 +565,13 @@ ngx_http_log_collection_request_body_chunked_filter(ngx_http_request_t *r, ngx_c
 		}
 	}
 
-	rc = ngx_http_request_body_save_filter(r, out);
+	rc = ngx_http_log_collection_process_request_body(r, out);
+
 	ngx_chain_update_chains(r->pool, &rb->free, &rb->busy, &out,
 				(ngx_buf_tag_t) &ngx_http_read_client_request_body);
 
 	return rc;
 }
-#endif
 
 ngx_int_t
 ngx_http_log_collection_add_variables(ngx_conf_t *cf)
@@ -1708,43 +1465,43 @@ ngx_http_log_collection_data_handler(ngx_http_log_collection_ctx_t *ctx, u_char 
 
 	for ( ;; ) {
 	 	switch(ctx->state) {
-		case log_collection_state_header:
-			rc = ngx_http_log_collection_open_file(ctx);
-			if (rc != NGX_OK) {
-				return rc;
-			}
-
-			ctx->state = log_collection_state_data;
-			break;
-		case log_collection_state_data:
-			if (ctx->log_content_decode) {
-				rc = ctx->buffer_handler(ctx, &start, &end);
-			} else {
-				rc = ngx_http_log_collection_process_buffer(ctx, start, end - start);
-			}
-			if (rc != NGX_OK) {
-				ngx_http_log_collection_abort_file(ctx);
-			}
-
-			ctx->written_length += end - start;
-			if (ctx->written_length >= ctx->body_length) {
-				ctx->state = log_collection_state_finish;
-			} else {
-				if (ctx->log_content_decode) {
-					ngx_http_log_collection_output_buffer_data_t *ob = ctx->buffer_handler_data;
-					if (ctx->written_length == ctx->body_length - (3 - (size_t) ob->need))
-					{
-						continue;
-					}
+			case log_collection_state_header:
+				rc = ngx_http_log_collection_open_file(ctx);
+				if (rc != NGX_OK) {
+					return rc;
 				}
 
-				goto done;
-			}
+				ctx->state = log_collection_state_data;
+				break;
+			case log_collection_state_data:
+				if (ctx->log_content_decode) {
+					rc = ctx->buffer_handler(ctx, &start, &end);
+				} else {
+					rc = ngx_http_log_collection_process_buffer(ctx, start, end - start);
+				}
+				if (rc != NGX_OK) {
+					ngx_http_log_collection_abort_file(ctx);
+				}
 
-			break;
-		case log_collection_state_finish:
-			ngx_http_log_collection_finish_file(ctx);
-			goto done;
+				ctx->written_length += end - start;
+				if (ctx->written_length >= ctx->body_length) {
+					ctx->state = log_collection_state_finish;
+				} else {
+					if (ctx->log_content_decode) {
+						ngx_http_log_collection_output_buffer_data_t *ob = ctx->buffer_handler_data;
+						if (ctx->written_length == ctx->body_length - (3 - (size_t) ob->need))
+						{
+							continue;
+						}
+					}
+
+					goto done;
+				}
+
+				break;
+			case log_collection_state_finish:
+				ngx_http_log_collection_finish_file(ctx);
+				goto done;
 		}
 	}
 
@@ -1756,7 +1513,7 @@ done:
  * Process client request body
  * ngx_http_log_collection_data_handler will be called
  */
-static ngx_int_t
+ngx_int_t
 ngx_http_log_collection_process_request_body(ngx_http_request_t *r, ngx_chain_t *body)
 {
 	ngx_int_t rc;
@@ -1770,6 +1527,7 @@ ngx_http_log_collection_process_request_body(ngx_http_request_t *r, ngx_chain_t 
 		if(rc != NGX_OK)
 			return rc;
 
+		body->buf->pos = body->buf->last;
 		body = body->next;
 	}
 
@@ -1880,46 +1638,48 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 	ngx_http_core_loc_conf_t		*clcf;
 	ngx_msec_t						delay;
 	ngx_http_log_collection_ctx_t	*ctx = ngx_http_get_module_ctx(r, ngx_http_log_collection_module);
+	off_t							rest = 0;
+	ngx_chain_t						out;
 
 	c = r->connection;
 	rb = r->request_body;
 
-	ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
-		"http read client request body");
-
 	for ( ;; ) {
 		for ( ;; ) {
 			if (rb->buf->last == rb->buf->end) {
-#if defined nginx_version && nginx_version < 1003009
-				rc = ngx_http_log_collection_process_request_body(r, rb->to_write);
-#else
-				rc = ngx_http_log_collection_process_request_body(r, rb->bufs);
-#endif
+				/* pass buffer to request body filter chain */
+				out.buf = rb->buf;
+				out.next = NULL;
+
+				rc = ngx_http_log_collection_request_body_filter(r, &out);
 
 				switch(rc) {
-				case NGX_OK:
-					break;
-				case NGX_LOG_COLLECTION_MALFORMED:
-					return NGX_HTTP_BAD_REQUEST;
-				case NGX_LOG_COLLECTION_TOOLARGE:
-					return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
-				case NGX_LOG_COLLECTION_IOERROR:
-					return NGX_HTTP_SERVICE_UNAVAILABLE;
-				case NGX_LOG_COLLECTION_NOMEM:
-				default:
+					case NGX_OK:
+						break;
+					case NGX_LOG_COLLECTION_MALFORMED:
+						return NGX_HTTP_BAD_REQUEST;
+					case NGX_LOG_COLLECTION_TOOLARGE:
+						return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+					case NGX_LOG_COLLECTION_IOERROR:
+						return NGX_HTTP_SERVICE_UNAVAILABLE;
+					case NGX_LOG_COLLECTION_NOMEM:
+					default:
+						return NGX_HTTP_INTERNAL_SERVER_ERROR;
+				}
+
+				if (rb->busy != NULL) {
 					return NGX_HTTP_INTERNAL_SERVER_ERROR;
 				}
 
-#if defined nginx_version && nginx_version < 1003009
-				rb->to_write = rb->bufs->next ? rb->bufs->next : rb->bufs;
-#endif
+				rb->buf->pos = rb->buf->start;
 				rb->buf->last = rb->buf->start;
 			}
 
 			size = rb->buf->end - rb->buf->last;
+			rest = rb->rest - (rb->buf->last - rb->buf->pos);
 
-			if ((off_t)size > rb->rest) {
-				size = (size_t)rb->rest;
+			if ((off_t)size > rest) {
+				size = (size_t) rest;
 			}
 
 			if (ctx->upload_limit_rate) {
@@ -1957,9 +1717,17 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 			}
 
 			rb->buf->last += n;
-			rb->rest -= n;
 			r->request_length += n;
 			ctx->received += n;
+
+			if (n == rest) {
+				out.buf = rb->buf;
+				out.next = NULL;
+
+				if ((rc = ngx_http_log_collection_request_body_filter(r, &out)) != NGX_OK) {
+					return rc;
+				}
+			}
 
 			if (rb->rest == 0) {
 				break;
@@ -2001,26 +1769,6 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 
 	if (c->read->timer_set) {
 		ngx_del_timer(c->read);
-	}
-
-#if defined nginx_version && nginx_version < 1003009
-	rc = ngx_http_log_collection_process_request_body(r, rb->to_write);
-#else
-	rc = ngx_http_log_collection_process_request_body(r, rb->bufs);
-#endif
-
-	switch(rc) {
-	case NGX_OK:
-		break;
-	case NGX_LOG_COLLECTION_MALFORMED:
-		return NGX_HTTP_BAD_REQUEST;
-	case NGX_LOG_COLLECTION_TOOLARGE:
-		return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
-	case NGX_LOG_COLLECTION_IOERROR:
-		return NGX_HTTP_SERVICE_UNAVAILABLE;
-	case NGX_LOG_COLLECTION_NOMEM:
-	default:
-		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	}
 
 	/* For we finished reading client request body,
@@ -2101,7 +1849,7 @@ ngx_http_read_log_collection_client_request_body(ngx_http_request_t *r, ngx_http
 {
 	ssize_t							size, preread;
 	ngx_buf_t						*b;
-	ngx_chain_t						*cl, **next;
+	ngx_chain_t						out;
 	ngx_http_request_body_t			*rb;
 	ngx_http_core_loc_conf_t		*clcf;
 	ngx_http_log_collection_ctx_t	*ctx = ngx_http_get_module_ctx(r, ngx_http_log_collection_module);
@@ -2111,7 +1859,11 @@ ngx_http_read_log_collection_client_request_body(ngx_http_request_t *r, ngx_http
 	r->main->count++;
 #endif
 
-	if (r->request_body || r->discard_body) {
+	if (
+#if defined nginx_version && nginx_version >= 8011
+		r != r->main ||
+#endif
+		r->request_body || r->discard_body) {
 		post_handler(r);
 		return NGX_OK;
 	}
@@ -2127,9 +1879,11 @@ ngx_http_read_log_collection_client_request_body(ngx_http_request_t *r, ngx_http
 		goto done;
 	}
 
+	rb->rest = -1;
+
 	r->request_body = rb;
 
-	if (r->headers_in.content_length_n <= 0) {
+	if (r->headers_in.content_length_n < 0 && !r->headers_in.chunked) {
 		post_handler(r);
 		return ctx->output_status;
 	}
@@ -2154,71 +1908,57 @@ ngx_http_read_log_collection_client_request_body(ngx_http_request_t *r, ngx_http
 
 		ctx->received = preread;
 
-		b = ngx_calloc_buf(r->pool);
-		if (b == NULL) {
-			rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
+		out.buf = r->header_in;
+		out.next = NULL;
+
+		if ((rc = ngx_http_log_collection_request_body_filter(r, &out)) != NGX_OK) {
 			goto done;
 		}
 
-		b->temporary = 1;
-		b->start = r->header_in->pos;
-		b->pos = r->header_in->pos;
-		b->last = r->header_in->last;
-		b->end = r->header_in->end;
+		r->request_length += preread - (r->header_in->last - r->header_in->pos);
 
-		rb->bufs = ngx_alloc_chain_link(r->pool);
-		if (rb->bufs == NULL) {
-			rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
-			goto done;
-		}
-
-		rb->bufs->buf = b;
-		rb->bufs->next = NULL;
-		rb->buf = b;
-
-		if (preread >= r->headers_in.content_length_n) {
-			/* the whole request body was pre-read */
-
-			r->header_in->pos += r->headers_in.content_length_n;
-			r->request_length += r->headers_in.content_length_n;
-
-			if (ngx_http_log_collection_process_request_body(r, rb->bufs) != NGX_OK) {
-				ngx_http_log_collection_finalization(ctx);
-				return NGX_HTTP_INTERNAL_SERVER_ERROR;
+		if (!r->headers_in.chunked
+			&& rb->rest > 0
+			&& rb->rest <= (off_t) (r->header_in->end - r->header_in->last))
+		{
+			/* the whole request body may be placed in r->header_in */
+			b = ngx_calloc_buf(r->pool);
+			if (b == NULL) {
+				rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
+				goto done;
 			}
 
-			post_handler(r);
-			return ctx->output_status;
-		}
+			b->temporary = 1;
+			b->start = r->header_in->pos;
+			b->pos = r->header_in->pos;
+			b->last = r->header_in->last;
+			b->end = r->header_in->end;
 
-		/*
-		 * to not consider the body as pipelined request in
-		 * ngx_http_set_keepalive()
-		 */
-		r->header_in->pos = r->header_in->last;
-		r->request_length += preread;
-		rb->rest = r->headers_in.content_length_n - preread;
+			rb->buf = b;
 
-		if (rb->rest <= (off_t) (b->end - b->last)) {
-			/* the whole request body may be placed in r->header_in */
-
-#if defined nginx_version && nginx_version < 1003009
-			rb->to_write = rb->bufs;
 			r->read_event_handler = ngx_http_read_log_collection_client_request_body_handler;
-#else
-			rb->buf = r->header_in;
-			r->read_event_handler = ngx_http_read_log_collection_request_body_handler_compatible;
-#endif
+			r->write_event_handler = ngx_http_request_empty_handler;
+
 			rc = ngx_http_do_read_log_collection_client_request_body(r);
 			goto done;
 		}
-
-		next = &rb->bufs->next;
-
 	} else {
-		b = NULL;
-		rb->rest = r->headers_in.content_length_n;
-		next = &rb->bufs;
+		/* set rb->rest */
+		if (ngx_http_log_collection_request_body_filter(r, NULL) != NGX_OK) {
+			rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
+			goto done;
+		}
+	}
+
+	if (rb->rest == 0) {
+		post_handler(r);
+		return ctx->output_status;
+	}
+
+	if (rb->rest < 0) {
+		ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, "negative request body rest");
+		rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
+		goto done;
 	}
 
 	clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
@@ -2226,17 +1966,14 @@ ngx_http_read_log_collection_client_request_body(ngx_http_request_t *r, ngx_http
 	size = clcf->client_body_buffer_size;
 	size += size >> 2;
 
-	if (rb->rest < (ssize_t) size) {
-		size = rb->rest;
+	if (!r->headers_in.chunked && rb->rest < (off_t) size) {
+		size = (ssize_t) rb->rest;
 
 		if (r->request_body_in_single_buf) {
 			size += preread;
 		}
 	} else {
 		size = clcf->client_body_buffer_size;
-
-		/* disable copying buffer for r->request_body_in_single_buf */
-		b = NULL;
 	}
 
 	rb->buf = ngx_create_temp_buf(r->pool, size);
@@ -2245,28 +1982,8 @@ ngx_http_read_log_collection_client_request_body(ngx_http_request_t *r, ngx_http
 		goto done;
 	}
 
-	cl = ngx_alloc_chain_link(r->pool);
-	if (cl == NULL) {
-		rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
-		goto done;
-	}
-
-	cl->buf = rb->buf;
-	cl->next = NULL;
-
-	if (b && r->request_body_in_single_buf) {
-		size = b->last - b->pos;
-		ngx_memcpy(rb->buf->pos, b->pos, size);
-		rb->buf->last += size;
-
-		next = &rb->bufs;
-	}
-
-	*next = cl;
-#if defined nginx_version && nginx_version < 1003009
-	rb->to_write = rb->bufs;
-#endif
 	r->read_event_handler = ngx_http_read_log_collection_client_request_body_handler;
+	r->write_event_handler = ngx_http_request_empty_handler;
 
 	rc = ngx_http_do_read_log_collection_client_request_body(r);
 
