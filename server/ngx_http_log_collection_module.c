@@ -50,6 +50,11 @@
  * Recode body reading functionality,
  * refering to https://github.com/hongzhidao/nginx-upload-module, many thanks.
  * Code on 2016-10-09.
+ *
+ * Version 2.2:
+ * Rename some functions and variables in order to be easily.
+ * Add data purification.
+ * Code on 2016-10-11.
  */
 #include <ngx_config.h>
 #include <ngx_core.h>
@@ -80,6 +85,11 @@ typedef enum {
 	log_collection_state_data,
 	log_collection_state_finish
 } ngx_http_log_collection_state_t;
+
+typedef enum {
+	log_collection_form_name,
+	log_collection_form_value
+} ngx_http_log_collection_form_t;
 
 /*
  * Log collection cleanup record
@@ -114,6 +124,7 @@ typedef struct ngx_http_log_collection_loc_conf_s {
 	ngx_flag_t	all_in_single_folder;
 	ngx_flag_t	log_collection_switch;
 	ngx_flag_t	log_content_decode;
+	ngx_flag_t	log_content_purify;
 	ngx_flag_t	redirect_to_backend;
 	ngx_path_t	*store_path;
 	ngx_str_t	store_map_to_uri;
@@ -132,15 +143,15 @@ struct ngx_http_log_collection_ctx_s;
 typedef ngx_int_t (*ngx_http_log_collection_process_buffer_handler_pt)
 		(struct ngx_http_log_collection_ctx_s *ctx, u_char *, size_t);
 
-typedef struct ngx_http_log_collection_output_buffer_handler_s {
+typedef struct ngx_http_log_collection_decode_output_buffer_data_s {
 	unsigned int	need:2;
 	ngx_pool_t		*pool;
 	ngx_http_log_collection_process_buffer_handler_pt buffer_handler;
 	size_t			decoded_length;
 	u_char			left[1];
-} ngx_http_log_collection_output_buffer_data_t;
+} ngx_http_log_collection_decode_output_buffer_data_t;
 
-typedef struct ngx_http_log_collection_backend_handler_s {
+typedef struct ngx_http_log_collection_backend_data_s {
 	/* for backend */
 	ngx_str_t				field_name;
 	ngx_str_t				text_len;
@@ -150,23 +161,35 @@ typedef struct ngx_http_log_collection_backend_handler_s {
 	ngx_chain_t				*last;
 } ngx_http_log_collection_backend_data_t;
 
-typedef ngx_int_t (*ngx_http_log_collection_request_body_data_handler_pt)
+typedef struct ngx_http_log_collection_purify_output_buffer_data_s {
+	ngx_http_log_collection_form_t	form_state;
+	ngx_chain_t						*form_name;
+	ngx_flag_t						form_name_flag;
+	ngx_chain_t						**current;
+	u_char							*last_form_name_pos;
+	u_char							*last_form_value_pos;
+} ngx_http_log_collection_purify_output_buffer_data_t;
+
+typedef ngx_int_t (*ngx_http_log_collection_process_request_body_handler_pt)
 		(struct ngx_http_log_collection_ctx_s *ctx, u_char *, u_char *);
 
-typedef ngx_int_t (*ngx_http_log_collection_output_buffer_handler_pt)
+typedef ngx_int_t (*ngx_http_log_collection_decode_output_buffer_handler_pt)
 		(struct ngx_http_log_collection_ctx_s *ctx, u_char **, u_char **);
 
 typedef ngx_int_t (*ngx_http_log_collection_backend_handler_pt)
 		(ngx_http_request_t *r);
+
+typedef ngx_int_t (*ngx_http_log_collection_purify_output_buffer_handler_pt)
+		(struct ngx_http_log_collection_ctx_s *ctx, u_char **, u_char **);
 
 /*
  * Log collection module context
  */
 typedef struct ngx_http_log_collection_ctx_s {
 	ngx_http_log_collection_state_t	state;
-	ngx_http_log_collection_request_body_data_handler_pt data_handler;
-	ngx_http_log_collection_output_buffer_handler_pt     buffer_handler;
-	void						*buffer_handler_data; /* for buffer_handler */
+	ngx_http_log_collection_process_request_body_handler_pt data_handler;
+	ngx_http_log_collection_decode_output_buffer_handler_pt decode_output_buffer_handler;
+	void						*decode_output_buffer_handler_data;
 	ngx_file_t					output_file;
 	ngx_http_request_t			*request;
 	ngx_log_t					*log;
@@ -189,6 +212,10 @@ typedef struct ngx_http_log_collection_ctx_s {
 	unsigned int				discard_data:1; 
 	unsigned int				log_content_decode:1;
 	unsigned int				redirect_to_backend:1;
+
+	ngx_http_log_collection_purify_output_buffer_handler_pt purify_output_buffer_handler;
+	unsigned int				log_content_purify:1;
+	void						*purify_output_buffer_handler_data;
 } ngx_http_log_collection_ctx_t;
 
 /*
@@ -208,7 +235,7 @@ static char *ngx_http_log_collection(ngx_conf_t *cf, ngx_command_t *cmd, void *c
 static void *ngx_http_log_collection_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_log_collection_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
 static ngx_int_t ngx_http_test_expect(ngx_http_request_t *r);
-static ngx_int_t ngx_http_log_collection_process_buffer(ngx_http_log_collection_ctx_t *ctx,
+static ngx_int_t ngx_http_log_collection_process_buffer_handler(ngx_http_log_collection_ctx_t *ctx,
 			u_char *buffer, size_t len);
 static ngx_int_t ngx_http_log_collection_get_variable(ngx_http_request_t *r,
 	ngx_http_variable_value_t *v, uintptr_t data);
@@ -257,6 +284,14 @@ static ngx_command_t ngx_http_log_collection_commands[] = {
 		ngx_conf_set_flag_slot,
 		NGX_HTTP_LOC_CONF_OFFSET,
 		offsetof(ngx_http_log_collection_loc_conf_t, log_content_decode),
+		NULL
+	},
+	{
+		ngx_string("log_content_purify"),
+		NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+		ngx_conf_set_flag_slot,
+		NGX_HTTP_LOC_CONF_OFFSET,
+		offsetof(ngx_http_log_collection_loc_conf_t, log_content_purify),
 		NULL
 	},
 	{
@@ -1192,7 +1227,7 @@ ngx_http_log_collection_do_urldecode(u_char *in, size_t *len)
 }
 
 static ngx_int_t
-ngx_http_log_collection_urldecode(ngx_http_log_collection_output_buffer_data_t *ob,
+ngx_http_log_collection_urldecode(ngx_http_log_collection_decode_output_buffer_data_t *dob,
 			u_char *buffer, size_t *len)
 {
 	/* Note from RFC1630:  "Sequences which start with a percent sign
@@ -1201,7 +1236,7 @@ ngx_http_log_collection_urldecode(ngx_http_log_collection_output_buffer_data_t *
 	 */
 	size_t		l;
 	ngx_uint_t	i = 0;
-	u_char		*temp = ngx_pcalloc(ob->pool, *len);
+	u_char		*temp = ngx_pcalloc(dob->pool, *len);
 
 	if (temp == NULL) {
 		return NGX_LOG_COLLECTION_NOMEM;
@@ -1210,14 +1245,14 @@ ngx_http_log_collection_urldecode(ngx_http_log_collection_output_buffer_data_t *
 	for (i = 0; i < (ngx_uint_t) *len; /* void */) {
 		if (buffer[i] == '%') {
 			if ((i == *len - 1) || ((i + 1 == *len - 1) && (buffer[i + 1] == '%'))) {
-				ob->need = 2;
-				ob->left[0] = buffer[i++];
+				dob->need = 2;
+				dob->left[0] = buffer[i++];
 				*len -= (i == *len) ? 1 : 0;
 				break;
 			} else if (i + 1 == *len - 1) {
-				ob->need = 1;
-				ob->left[0] = buffer[i++];
-				ob->left[1] = buffer[i++];
+				dob->need = 1;
+				dob->left[0] = buffer[i++];
+				dob->left[1] = buffer[i++];
 				*len -= 2;
 				break;
 			} else {
@@ -1225,19 +1260,19 @@ ngx_http_log_collection_urldecode(ngx_http_log_collection_output_buffer_data_t *
 				ngx_http_log_collection_do_urldecode(buffer + i, &l);
 				
 				if (l == 3) {
-					temp[ob->decoded_length++] = buffer[i++];
-					temp[ob->decoded_length++] = buffer[i++];
-					temp[ob->decoded_length++] = buffer[i++];
+					temp[dob->decoded_length++] = buffer[i++];
+					temp[dob->decoded_length++] = buffer[i++];
+					temp[dob->decoded_length++] = buffer[i++];
 					continue;
 				}
 
 				if (l == 2) {
-					temp[ob->decoded_length++] = buffer[i++];
+					temp[dob->decoded_length++] = buffer[i++];
 					continue;
 				}
 
 				if (l == 1) {
-					temp[ob->decoded_length++] = (u_char) buffer[i];
+					temp[dob->decoded_length++] = (u_char) buffer[i];
 					i += 2;
 				}
 
@@ -1247,87 +1282,223 @@ ngx_http_log_collection_urldecode(ngx_http_log_collection_output_buffer_data_t *
 		}
 
 		if (buffer[i] == '+') {
-			temp[ob->decoded_length++] = ' ';
+			temp[dob->decoded_length++] = ' ';
 			i++;
 			continue;
 		}
 
-		temp[ob->decoded_length++] = buffer[i++];
+		temp[dob->decoded_length++] = buffer[i++];
 	}
 
-	if (ob->decoded_length) {
-		(void) ngx_memcpy(buffer, temp, ob->decoded_length);
+	if (dob->decoded_length) {
+		(void) ngx_memcpy(buffer, temp, dob->decoded_length);
 	}
 
 	return NGX_OK;
 }
 
 /*
- * Callback function for process output_buffer.
- * By default, wo call ngx_http_log_collection_process_buffer.
+ * Purify content.
  */
 static ngx_int_t
-ngx_http_log_collection_output_buffer_handler(ngx_http_log_collection_ctx_t *ctx, u_char **start, u_char **end)
+ngx_http_log_collection_purify_output_buffer_handler(ngx_http_log_collection_ctx_t *ctx,
+			u_char **start, u_char **end)
 {
-	ngx_http_log_collection_output_buffer_data_t *ob;
+	ngx_int_t rc = NGX_OK;
+	u_char *s = *start, *e = *end, *purify_s = NULL, *purify_e = NULL;
+	ngx_http_log_collection_purify_output_buffer_data_t *data = ctx->purify_output_buffer_handler_data;
+	ngx_chain_t	*cl = NULL;
+	ssize_t		size = 0;
+	const u_char *const_s = *start;
+	
+	data->last_form_name_pos = s;
+	data->last_form_value_pos = s;
+
+	while (s <= e) {
+		switch (data->form_state) {
+			case log_collection_form_name:
+				if (s == const_s) {
+					if (!data->form_name_flag) {
+						if (*s == '&' || *s == '=') {
+							ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Format is &xx or =xx");
+							return NGX_LOG_COLLECTION_MALFORMED;
+						}
+
+						data->form_name_flag = 1;
+					} else {
+						if (*s == '&') {
+							ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Format is xx&");
+							return NGX_LOG_COLLECTION_MALFORMED;
+						}
+					}
+				}
+
+				if (*s == '&') {
+					ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Format is x&x= or x&x");
+					return NGX_LOG_COLLECTION_MALFORMED;
+				}
+
+				/* form name found */
+				if (*s == '=' || s == e) {
+					if (*s == '=') {
+						size = s - data->last_form_name_pos;
+					} else {
+						size = s - data->last_form_name_pos + 1;
+					}
+
+					data->form_state = log_collection_form_value;
+					cl = ngx_pcalloc(ctx->request->pool, sizeof(ngx_chain_t));
+					if (cl == NULL) {
+						ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Alloc space for chain of the form name failed");
+						return NGX_HTTP_INTERNAL_SERVER_ERROR;
+					}
+
+					cl->buf = ngx_create_temp_buf(ctx->request->pool, size);
+					if (cl->buf == NULL) {
+						ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Alloc space for buf of the form name failed");
+						return NGX_HTTP_INTERNAL_SERVER_ERROR;
+					}
+
+					(void) ngx_cpymem(cl->buf->pos, data->last_form_name_pos, size);
+
+					cl->next = NULL;
+
+					if (!data->form_name) {
+						data->form_name = cl;
+					} else {
+						*data->current = cl;
+					}
+
+					data->current = &cl->next;
+
+					if (*s == '=' && s != e) {
+						data->last_form_value_pos = s + 1;
+					}
+
+					break;
+				}
+
+				break;
+			case log_collection_form_value:
+				if (*s == '=') {
+					ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Format is xx=yy=");
+					return NGX_LOG_COLLECTION_MALFORMED;
+				}
+
+				if (*s == '&' || s == e) {
+					/* form value ended */
+					if (*s == '&') {
+						data->form_state = log_collection_form_name;
+						data->form_name_flag = 0;
+					}
+
+					if (*s == '&') {
+						size = s - data->last_form_value_pos;
+					} else {
+						size = s - data->last_form_value_pos + 1;
+					}
+
+					if (ctx->log_content_decode) {
+						purify_s = data->last_form_value_pos;
+						purify_e = s;
+
+						rc = ctx->decode_output_buffer_handler(ctx, &purify_s, &purify_e);
+
+						if (purify_s != data->last_form_value_pos) {
+							*start = purify_s;
+						}
+
+						if (purify_e != s) {
+							*end = purify_e;
+						}
+					} else {
+						rc = ngx_http_log_collection_process_buffer_handler(ctx,
+							data->last_form_value_pos, size);
+					}
+
+					if (rc != NGX_OK) {
+						return rc;
+					}
+				}
+
+				if (*s == '&' && s != e) {
+					data->last_form_name_pos = s + 1;
+				}
+		}
+
+		++s;
+	}
+
+	return rc;
+}
+
+/*
+ * Callback function for process output_buffer.
+ * By default, we call ngx_http_log_collection_process_buffer_handler.
+ */
+static ngx_int_t
+ngx_http_log_collection_decode_output_buffer_handler(ngx_http_log_collection_ctx_t *ctx,
+			u_char **start, u_char **end)
+{
+	ngx_http_log_collection_decode_output_buffer_data_t *dob;
 	size_t l = 3;
 	size_t pos = 0;
 	size_t len = *end - *start;
 	ngx_int_t rc;
 
 	if (ctx->discard_data == 0) {
-		if (ctx->buffer_handler_data == NULL) {
-			ob = ngx_pcalloc(ctx->request->pool, 
-				sizeof(ngx_http_log_collection_output_buffer_data_t) + 3);
+		if (ctx->decode_output_buffer_handler_data == NULL) {
+			dob = ngx_pcalloc(ctx->request->pool, 
+				sizeof(ngx_http_log_collection_decode_output_buffer_data_t) + 3);
 
-			if (ob == NULL) {
+			if (dob == NULL) {
 				ctx->discard_data = 1;
 				return NGX_LOG_COLLECTION_NOMEM;
 			}
 
-			ob->pool = ctx->request->pool;
-			ctx->buffer_handler_data = ob;
-			ob->buffer_handler = ngx_http_log_collection_process_buffer;
+			dob->pool = ctx->request->pool;
+			ctx->decode_output_buffer_handler_data = dob;
+			dob->buffer_handler = ngx_http_log_collection_process_buffer_handler;
 		} else {
-			ob = ctx->buffer_handler_data;
+			dob = ctx->decode_output_buffer_handler_data;
 		}
 
 		/* this was a '%' or '%X' in output_buffer last receive */
-		if (ob->need) {
-			if (ctx->written_length == ctx->body_length - (3 - (size_t) ob->need)) {
-				ctx->written_length += 3 - (size_t) ob->need;
+		if (dob->need) {
+			if (ctx->written_length == ctx->body_length - (3 - (size_t) dob->need)) {
+				ctx->written_length += 3 - (size_t) dob->need;
 				*end = *start;
-				if (ob->buffer_handler) {
-					return ob->buffer_handler(ctx, ob->left, 3 - (size_t) ob->need);
+				if (dob->buffer_handler) {
+					return dob->buffer_handler(ctx, dob->left, 3 - (size_t) dob->need);
 				}
 			}
 
-			(void) ngx_memcpy(ob->left + 3 - (size_t) ob->need, *start, (size_t) ob->need);
-			ngx_http_log_collection_do_urldecode(ob->left, &l);
+			(void) ngx_memcpy(dob->left + 3 - (size_t) dob->need, *start, (size_t) dob->need);
+			ngx_http_log_collection_do_urldecode(dob->left, &l);
 
-			if (ob->buffer_handler) {
-				(void) ob->buffer_handler(ctx, ob->left, l);
+			if (dob->buffer_handler) {
+				(void) dob->buffer_handler(ctx, dob->left, l);
 			}
 
-			ctx->written_length += 3 - (size_t) ob->need;
-			pos += (size_t) ob->need;
-			len -= (size_t) ob->need;
-			ob->need = 0;
+			ctx->written_length += 3 - (size_t) dob->need;
+			pos += (size_t) dob->need;
+			len -= (size_t) dob->need;
+			dob->need = 0;
 		}
 
-		rc = ngx_http_log_collection_urldecode(ob, *start + pos, &len);
+		rc = ngx_http_log_collection_urldecode(dob, *start + pos, &len);
 		if (rc != NGX_OK) {
 			ctx->discard_data = 1;
 			return rc;
 		}
 
-		if (ob->buffer_handler) {
-			rc = ob->buffer_handler(ctx, *start + pos, ob->decoded_length);
-			ob->decoded_length = 0;
+		if (dob->buffer_handler) {
+			rc = dob->buffer_handler(ctx, *start + pos, dob->decoded_length);
+			dob->decoded_length = 0;
 		}
 
-		if (ob->need) {
-			*end -= 3 - (size_t) ob->need;
+		if (dob->need) {
+			*end -= 3 - (size_t) dob->need;
 		}
 
 		return rc;
@@ -1389,7 +1560,7 @@ ngx_http_log_collection_finalization(ngx_http_log_collection_ctx_t *ctx)
  * Copy client request body to buffer or write to file
  */
 ngx_int_t
-ngx_http_log_collection_process_buffer(ngx_http_log_collection_ctx_t *ctx, u_char *buffer, size_t len)
+ngx_http_log_collection_process_buffer_handler(ngx_http_log_collection_ctx_t *ctx, u_char *buffer, size_t len)
 {
 	ngx_int_t rc;
 	size_t buffer_pos = 0;
@@ -1432,9 +1603,10 @@ ngx_http_log_collection_process_buffer(ngx_http_log_collection_ctx_t *ctx, u_cha
  * Process received data
  */
 static ngx_int_t
-ngx_http_log_collection_data_handler(ngx_http_log_collection_ctx_t *ctx, u_char *start, u_char *end)
+ngx_http_log_collection_process_request_body_handler(ngx_http_log_collection_ctx_t *ctx, u_char *start, u_char *end)
 {
 	ngx_int_t rc;
+	ngx_http_log_collection_purify_output_buffer_data_t *data = ctx->purify_output_buffer_handler_data;
 
 	if (start == end) {
 		if (ctx->state != log_collection_state_finish) {
@@ -1447,10 +1619,12 @@ ngx_http_log_collection_data_handler(ngx_http_log_collection_ctx_t *ctx, u_char 
 
 	if (ctx->written_length != 0) {
 		if (ctx->written_length + (size_t) (end - start) > ctx->body_length) {
-			if (ctx->log_content_decode) {
-				rc = ctx->buffer_handler(ctx, &start, &end);
+			if (ctx->log_content_purify) {
+				rc = ctx->purify_output_buffer_handler(ctx, &start, &end);
+			} else if (ctx->log_content_decode) {
+				rc = ctx->decode_output_buffer_handler(ctx, &start, &end);
 			} else {
-				rc = ngx_http_log_collection_process_buffer(ctx, start,
+				rc = ngx_http_log_collection_process_buffer_handler(ctx, start,
 							ctx->body_length - ctx->written_length);
 			}
 
@@ -1472,13 +1646,20 @@ ngx_http_log_collection_data_handler(ngx_http_log_collection_ctx_t *ctx, u_char 
 				}
 
 				ctx->state = log_collection_state_data;
+				if (ctx->log_content_purify) {
+					data->form_state = log_collection_form_name;
+					data->current = &data->form_name;
+				}
 				break;
 			case log_collection_state_data:
-				if (ctx->log_content_decode) {
-					rc = ctx->buffer_handler(ctx, &start, &end);
+				if (ctx->log_content_purify) {
+					rc = ctx->purify_output_buffer_handler(ctx, &start, &end);
+				} else if (ctx->log_content_decode) {
+					rc = ctx->decode_output_buffer_handler(ctx, &start, &end);
 				} else {
-					rc = ngx_http_log_collection_process_buffer(ctx, start, end - start);
+					rc = ngx_http_log_collection_process_buffer_handler(ctx, start, end - start);
 				}
+
 				if (rc != NGX_OK) {
 					ngx_http_log_collection_abort_file(ctx);
 				}
@@ -1488,8 +1669,9 @@ ngx_http_log_collection_data_handler(ngx_http_log_collection_ctx_t *ctx, u_char 
 					ctx->state = log_collection_state_finish;
 				} else {
 					if (ctx->log_content_decode) {
-						ngx_http_log_collection_output_buffer_data_t *ob = ctx->buffer_handler_data;
-						if (ctx->written_length == ctx->body_length - (3 - (size_t) ob->need))
+						ngx_http_log_collection_decode_output_buffer_data_t *dob =
+							ctx->decode_output_buffer_handler_data;
+						if (ctx->written_length == ctx->body_length - (3 - (size_t) dob->need))
 						{
 							continue;
 						}
@@ -1511,7 +1693,7 @@ done:
 
 /*
  * Process client request body
- * ngx_http_log_collection_data_handler will be called
+ * ngx_http_log_collection_process_request_body_handler will be called
  */
 ngx_int_t
 ngx_http_log_collection_process_request_body(ngx_http_request_t *r, ngx_chain_t *body)
@@ -2123,6 +2305,7 @@ ngx_http_log_collection_create_loc_conf(ngx_conf_t *cf)
 
 	conf->all_in_single_folder = NGX_CONF_UNSET;
 	conf->log_content_decode = NGX_CONF_UNSET;
+	conf->log_content_purify = NGX_CONF_UNSET;
 	conf->upload_limit_rate = NGX_CONF_UNSET_SIZE;
 	conf->output_buffer_size = NGX_CONF_UNSET_SIZE;
 	conf->max_file_size = NGX_CONF_UNSET;
@@ -2144,6 +2327,7 @@ ngx_http_log_collection_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child
 	// ngx_conf_merge_path_value(cf, &conf->store_path, prev->store_path, &ngx_http_log_collection_temp_path);
 	ngx_conf_merge_value(conf->all_in_single_folder, prev->all_in_single_folder, 0);
 	ngx_conf_merge_value(conf->log_content_decode, prev->log_content_decode, 1);
+	ngx_conf_merge_value(conf->log_content_purify, prev->log_content_purify, 1);
 	ngx_conf_merge_off_value(conf->max_file_size, prev->max_file_size, 0);
 	ngx_conf_merge_size_value(conf->max_request_body_size, prev->max_request_body_size, (size_t) 64 * 1024);
 	ngx_conf_merge_size_value(conf->output_buffer_size, prev->output_buffer_size, (size_t) 64 * 1024);
@@ -2184,11 +2368,29 @@ ngx_http_log_collection_handler(ngx_http_request_t *r)
 	ctx->state = log_collection_state_header;
 	ctx->request = r;
 	ctx->log = r->connection->log;
-	ctx->data_handler = ngx_http_log_collection_data_handler;
+	ctx->data_handler = ngx_http_log_collection_process_request_body_handler;
 
 	if (lclcf->log_content_decode == 1) {
 		ctx->log_content_decode = 1;
-		ctx->buffer_handler = ngx_http_log_collection_output_buffer_handler;
+		ctx->decode_output_buffer_handler = ngx_http_log_collection_decode_output_buffer_handler;
+	}
+
+	if (lclcf->log_content_purify == 1) {
+		ctx->log_content_purify = 1;
+		ctx->purify_output_buffer_handler = ngx_http_log_collection_purify_output_buffer_handler;
+
+		if (ctx->purify_output_buffer_handler_data == NULL) {
+			ctx->purify_output_buffer_handler_data = ngx_pcalloc(
+				ctx->request->pool,
+				sizeof(ngx_http_log_collection_purify_output_buffer_data_t));
+
+			if (ctx->purify_output_buffer_handler_data == NULL) {
+				return NGX_HTTP_INTERNAL_SERVER_ERROR;
+			}
+
+			((ngx_http_log_collection_purify_output_buffer_data_t *)ctx->purify_output_buffer_handler_data)->form_state =
+				log_collection_form_name;
+		}
 	}
 
 	if (lclcf->redirect_to_backend == 1) {
