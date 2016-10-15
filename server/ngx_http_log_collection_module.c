@@ -60,6 +60,11 @@
  * Beautify the code.
  * Add backend processing depends on the upload content.
  * Code on 2016-10-15.
+ *
+ * Version 2.4:
+ * Fix a bug: if redirect to backend disabled, nothing stored.
+ * Fix a bug: urldecode ' ' -> '+'
+ * Code on 2016-10-16.
  */
 #include <ngx_config.h>
 #include <ngx_core.h>
@@ -1259,12 +1264,10 @@ ngx_http_log_collection_urldecode(ngx_http_log_collection_decode_output_buffer_d
 					temp[dob->decoded_length++] = buffer[i++];
 					temp[dob->decoded_length++] = buffer[i++];
 					temp[dob->decoded_length++] = buffer[i++];
-					continue;
 				}
 
 				if (l == 2) {
 					temp[dob->decoded_length++] = buffer[i++];
-					continue;
 				}
 
 				if (l == 1) {
@@ -1273,17 +1276,16 @@ ngx_http_log_collection_urldecode(ngx_http_log_collection_decode_output_buffer_d
 				}
 
 				i++;
-				continue;
 			}
-		}
-
-		if (buffer[i] == '+') {
+		} else if (buffer[i] == '+') {
 			temp[dob->decoded_length++] = ' ';
 			i++;
-			continue;
+		} else if (buffer[i] == ' ') {
+			temp[dob->decoded_length++] = '+';
+			i++;
+		} else {
+			temp[dob->decoded_length++] = buffer[i++];
 		}
-
-		temp[dob->decoded_length++] = buffer[i++];
 	}
 
 	if (dob->decoded_length) {
@@ -1417,9 +1419,9 @@ ngx_http_log_collection_process_output_buffer_handler(ngx_http_log_collection_ct
 				/* form name found */
 				if (*s == '=' || s == e) {
 					size = s - data->last_form_name_pos;
+					data->form_state = log_collection_form_value;
 
 					if (ctx->redirect_to_backend) {
-						data->form_state = log_collection_form_value;
 						cl = ngx_pcalloc(ctx->request->pool, sizeof(ngx_chain_t));
 						if (cl == NULL) {
 							ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Alloc space for chain of the form name failed");
@@ -2558,7 +2560,6 @@ ngx_http_log_collection_handler(ngx_http_request_t *r)
 
 	if (lclcf->log_content_purify == 1) {
 		rbd->log_content_purify = 1;
-		rbd->form_state = log_collection_form_name;
 	}
 
 	if (lclcf->redirect_to_backend == 1) {
