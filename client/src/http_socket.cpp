@@ -164,7 +164,8 @@ void* CHttpSocket::DoWork(void *arg)
 	const string str = "content=This+is+a+test+string+in+the+log+collection+client"
 					   "+programm%2C+first+coded+on+2016.03.08+by+Xingyuan+Wang%2C"
 					   "+which+is+used+to+test+the+log+collection+server+module+in+"
-					   "nginx-1.2.6%0D%0A";
+					   "nginx, versions 1.2.6, 1.8.1 and 1.9.12 were tested on 2016"
+					   "-10-10-15.%0D%0A";
 	stringstream s;
 	string size, req;
 	ssize_t all, r = 0, delta = 0;
