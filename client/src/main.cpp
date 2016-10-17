@@ -90,7 +90,7 @@ int main(int argc, char* argv[])
 		}
 
 		uuid = uuid_prefix + uuid;
-		test = new CHttpSocket(uuid, argv[1], port, "/log_collection", 5, 1000);
+		test = new CHttpSocket(uuid, server, port, "/log_collection", worker, loop);
 
 		if (test) {
 			test_array.push_back(test);
