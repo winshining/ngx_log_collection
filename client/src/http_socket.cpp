@@ -165,7 +165,7 @@ void* CHttpSocket::DoWork(void *arg)
 		"+programm%2C+first+coded+on+2016.03.08+by+Xingyuan+Wang%2C"
 		"+which+is+used+to+test+the+log+collection+server+module+in+"
 		"nginx,+versions+1.2.6,+1.8.1+and+1.9.12+were+tested+on+2016"
-		"-10-10-15.%0D%0AThe+following+blanks+is+intended+to+tested"
+		"-10-10-15.%0D%0AThe+following+blanks+is+intended+to+tested+"
 		"the+urldecode+functionality+of+the+module:           %0D%0A";
 
 	stringstream s;

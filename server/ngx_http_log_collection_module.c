@@ -65,6 +65,10 @@
  * Fix a bug: if redirect to backend disabled, nothing stored.
  * Fix a bug: urldecode ' ' -> '+'
  * Code on 2016-10-16.
+ *
+ * Add content length in normal response.
+ * Optimize code.
+ * Code on 2016-10-17 & 2016-10-18.
  */
 #include <ngx_config.h>
 #include <ngx_core.h>
@@ -72,6 +76,8 @@
 #include <nginx.h>
 
 #define CLIENT_UUID_STRING			"Client-UUID" /* user defined */
+#define UUID_STRING_LENGTH			36
+#define IP_STRING_MAX_LENGTH		15
 #define CONTENT_TYPE_VALUE_STRING	"application/x-www-form-urlencoded"
 /*
  * Information about MIME refers to:
@@ -80,6 +86,7 @@
 
 #define OUTPUT_STRING_DONE				"Done."
 #define OUTPUT_STRING_CONTENT_NEEDED	"Content needed."
+#define OUTPUT_STRING_CONTENT_LENGTH	"Content length"
 
 #define MAX_NUMBER_STRING				"18446744073709551616"
 #define FILE_POSTFIX_FORMAT				"1970_01_01_00_00_00"
@@ -171,7 +178,6 @@ typedef struct ngx_http_log_collection_backend_data_s {
 	ngx_str_t				text_len;
 	off_t					text_len_n;
 	ngx_str_t				file_loc;
-	size_t					output_body_length;
 	ngx_chain_t				*chain;
 	ngx_chain_t				*last;
 } ngx_http_log_collection_backend_data_t;
@@ -442,7 +448,7 @@ ngx_http_log_collection_request_body_length_filter(ngx_http_request_t *r, ngx_ch
 
 	if (rb->rest == -1) {
 		ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-			"http request body content length filter");
+			"Http request body content length filter");
 		rb->rest = r->headers_in.content_length_n;
 	}
 
@@ -508,7 +514,7 @@ ngx_http_log_collection_request_body_chunked_filter(ngx_http_request_t *r, ngx_c
 
     if (rb->rest == -1) {
 		ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-			"http request body chunked filter");
+			"Http request body chunked filter");
 
 		rb->chunked = ngx_pcalloc(r->pool, sizeof(ngx_http_chunked_t));
 		if (rb->chunked == NULL) {
@@ -525,7 +531,7 @@ ngx_http_log_collection_request_body_chunked_filter(ngx_http_request_t *r, ngx_c
 	for (cl = in; cl; cl = cl->next) {
 		for ( ;; ) {
 			ngx_log_debug7(NGX_LOG_DEBUG_EVENT, r->connection->log, 0,
-				"http body chunked buf "
+				"Http body chunked buf "
 				"t:%d f:%d %p, pos %p, size: %z file: %O, size: %z",
 				cl->buf->temporary, cl->buf->in_file,
 				cl->buf->start, cl->buf->pos,
@@ -544,7 +550,7 @@ ngx_http_log_collection_request_body_chunked_filter(ngx_http_request_t *r, ngx_c
 					< r->headers_in.content_length_n + rb->chunked->size)
 				{
 					ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-						"client intended to send too large chunked "
+						"Client intended to send too large chunked "
 						"body: %O bytes",
 						r->headers_in.content_length_n
 						+ rb->chunked->size);
@@ -616,8 +622,7 @@ ngx_http_log_collection_request_body_chunked_filter(ngx_http_request_t *r, ngx_c
 			}
 
 			/* invalid */
-			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-				"client sent invalid chunked body");
+			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Client sent invalid chunked body");
 
 			return NGX_HTTP_BAD_REQUEST;
 		}
@@ -662,7 +667,7 @@ ngx_http_log_collection_get_variable(ngx_http_request_t *r, ngx_http_variable_va
 	ctx = ngx_http_get_module_ctx(r, ngx_http_log_collection_module);
 
 	if (ctx->redirect_to_backend == 0) {
-		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "redirect_to_backend not set");
+		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Option redirect_to_backend not set");
 		return NGX_ERROR;
 	}
 
@@ -772,7 +777,7 @@ ngx_http_log_collection_backend_handler(ngx_http_request_t *r)
 		}
 
 		if (uri.len == 0) {
-			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "empty \"backend_handler\" (was: \"%V\")",
+			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Empty \"backend_handler\" (was: \"%V\")",
 				&lclcf->url_cv->value);
 			goto failed;
 		}
@@ -878,8 +883,6 @@ ngx_http_log_collection_append_str(ngx_http_log_collection_ctx_t *ctx, ngx_buf_t
 		bd->last->next = cl;
 		bd->last = cl;
 	}
-
-	bd->output_body_length += s->len;
 }
 
 static ngx_int_t
@@ -972,11 +975,11 @@ ngx_http_log_collection_open_file(ngx_http_log_collection_ctx_t *ctx)
 		return NGX_LOG_COLLECTION_NOMEM;
 	}
 	
-	/* length of uuid: 36, format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-	 * max length of ip: 15, format: xxx.xxx.xxx.xxx
+	/* length of uuid: UUID_STRING_LENGTH, format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+	 * max length of ip: IP_STRING_MAX_LENGTH, format: xxx.xxx.xxx.xxx
 	 * full format: /path/addr/uuid or /path/addr-uuid
 	 */
-	file->name.len = path->name.len + 1 + 15 + 1 + 36;
+	file->name.len = path->name.len + 1 + IP_STRING_MAX_LENGTH + 1 + UUID_STRING_LENGTH;
 	file->name.data = ngx_pcalloc(ctx->request->pool, file->name.len + 1);
 
 	if (file->name.data == NULL) {
@@ -1009,16 +1012,14 @@ ngx_http_log_collection_open_file(ngx_http_log_collection_ctx_t *ctx)
 	if (file->fd == NGX_INVALID_FILE) {
 		err = ngx_errno;
 
-		ngx_log_error(NGX_LOG_ERR, ctx->log, err,
-			"Fail to create file: %s", file->name.data);
+		ngx_log_error(NGX_LOG_ERR, ctx->log, err, "Fail to create file: %s", file->name.data);
 		return NGX_LOG_COLLECTION_IOERROR;
 	}
 
 	if (ngx_fd_info(file->fd, &file->info) == -1) {
 		err = ngx_errno;
 
-		ngx_log_error(NGX_LOG_EMERG, ctx->log, err,
-			ngx_fd_info_n " \"%s\" failed", file->name.data);
+		ngx_log_error(NGX_LOG_EMERG, ctx->log, err, ngx_fd_info_n " \"%s\" failed", file->name.data);
 	}
 
 	file->offset = (off_t) file->info.st_size;
@@ -1180,7 +1181,7 @@ ngx_http_log_collection_flush_to_file(ngx_http_log_collection_ctx_t *ctx)
 						ctx->output_file.offset) == NGX_ERROR)
 		{
 			ngx_log_error(NGX_LOG_ERR, ctx->log, ngx_errno,
-						"Write to file \"%V\" failed", &ctx->output_file.name);
+				"Write to file \"%V\" failed", &ctx->output_file.name);
 			rc = NGX_LOG_COLLECTION_IOERROR;
 		}
 
@@ -1424,13 +1425,15 @@ ngx_http_log_collection_process_output_buffer_handler(ngx_http_log_collection_ct
 					if (ctx->redirect_to_backend) {
 						cl = ngx_pcalloc(ctx->request->pool, sizeof(ngx_chain_t));
 						if (cl == NULL) {
-							ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Alloc space for chain of the form name failed");
+							ngx_log_error(NGX_LOG_ERR, ctx->log, 0,
+								"Alloc space for chain of the form name failed");
 							return NGX_HTTP_INTERNAL_SERVER_ERROR;
 						}
 
 						cl->buf = ngx_create_temp_buf(ctx->request->pool, size);
 						if (cl->buf == NULL) {
-							ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Alloc space for buf of the form name failed");
+							ngx_log_error(NGX_LOG_ERR, ctx->log, 0,
+								"Alloc space for buf of the form name failed");
 							return NGX_HTTP_INTERNAL_SERVER_ERROR;
 						}
 
@@ -1894,7 +1897,7 @@ ngx_http_log_collection_post_handler(ngx_http_request_t *r)
 {
 	ngx_int_t rc = NGX_OK;
 	ngx_buf_t *b;
-	ngx_chain_t out;
+	ngx_chain_t *out = NULL, **next = NULL;
 	ngx_http_log_collection_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_log_collection_module);
 
 	if (r->discard_body) {
@@ -1922,6 +1925,9 @@ ngx_http_log_collection_post_handler(ngx_http_request_t *r)
 
 		b->pos = (u_char *) OUTPUT_STRING_CONTENT_NEEDED;
 		b->last = b->pos + ngx_strlen(OUTPUT_STRING_CONTENT_NEEDED);
+		b->last_in_chain = 1;
+		b->last_buf = 1;
+		b->in_file = 0;
 	} else {
 		r->headers_out.status = NGX_HTTP_OK;
 		b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
@@ -1929,7 +1935,9 @@ ngx_http_log_collection_post_handler(ngx_http_request_t *r)
 			goto local_failed;
 		}
 
-		b->pos = ngx_pcalloc(r->pool, ngx_strlen(OUTPUT_STRING_DONE CRLF CLIENT_UUID_STRING ": ") + 36);
+		b->pos = ngx_pcalloc(r->pool, ngx_strlen(OUTPUT_STRING_DONE CRLF CLIENT_UUID_STRING ": ")
+			+ UUID_STRING_LENGTH + ngx_strlen(CRLF OUTPUT_STRING_CONTENT_LENGTH ": ")
+			+ ngx_strlen(MAX_NUMBER_STRING));
 		if (b->pos == NULL) {
 			goto local_failed;
 		}
@@ -1937,16 +1945,60 @@ ngx_http_log_collection_post_handler(ngx_http_request_t *r)
 		(void) ngx_memcpy(b->pos, OUTPUT_STRING_DONE CRLF CLIENT_UUID_STRING ": ",
 			ngx_strlen(OUTPUT_STRING_DONE CRLF CLIENT_UUID_STRING ": "));
 		(void) ngx_memcpy(b->pos + ngx_strlen(b->pos), ctx->client_uuid.data, ctx->client_uuid.len);
+		(void) ngx_memcpy(b->pos + ngx_strlen(b->pos), CRLF OUTPUT_STRING_CONTENT_LENGTH ": ",
+			ngx_strlen(CRLF OUTPUT_STRING_CONTENT_LENGTH ": "));
 
-		b->last = b->pos + ngx_strlen(OUTPUT_STRING_DONE CRLF CLIENT_UUID_STRING ": ") + 36;
+		b->last = b->pos + ngx_strlen(OUTPUT_STRING_DONE CRLF CLIENT_UUID_STRING ": ")
+			+ UUID_STRING_LENGTH + ngx_strlen(CRLF OUTPUT_STRING_CONTENT_LENGTH ": ");
+		b->last_in_chain = 0;
+		b->last_buf = 0;
+		b->in_file = 0;
 	}
 
 	r->headers_out.content_type.len = ngx_strlen("text/plain");
 	r->headers_out.content_type.data = (u_char *) "text/plain";
 
-	b->last_buf = 1;
 	b->memory = 1;
 	r->headers_out.content_length_n = b->last - b->pos;
+
+	out = ngx_pcalloc(ctx->request->pool, ((!r->headers_in.content_length_n) ? 1 : 2) * sizeof(ngx_chain_t));
+	if (out == NULL) {
+		ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Alloc space for out for response failed");
+		goto local_failed;
+	}
+
+	out->buf = b;
+	out->next = NULL;
+
+	if (r->headers_in.content_length_n > 0) {
+		next = &out->next;
+		*next = out + 1;
+
+		b = ngx_pcalloc(ctx->request->pool, sizeof(ngx_buf_t));
+		if (b == NULL) {
+			ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Alloc space for buf for response failed");
+			goto local_failed;
+		}
+
+		b->last_in_chain = 1;
+		b->last_buf = 1;
+		b->memory = 1;
+		b->in_file = 0;
+
+		b->pos = ngx_pcalloc(r->pool, ngx_strlen(MAX_NUMBER_STRING));
+		if (b->pos == NULL) {
+			ngx_log_error(NGX_LOG_ERR, ctx->log, 0,
+				"Alloc space for the real space of buf for response failed");
+			goto local_failed;
+		}
+
+		ngx_sprintf(b->pos, "%O", r->headers_in.content_length_n);
+		b->last = b->pos + ngx_strlen(b->pos);
+		r->headers_out.content_length_n += b->last - b->pos;
+
+		(*next)->buf = b;
+		(*next)->next = NULL;
+	}
 
 	rc = ngx_http_send_header(r);
 	if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
@@ -1954,14 +2006,11 @@ ngx_http_log_collection_post_handler(ngx_http_request_t *r)
 		return;
 	}
 
-	out.buf = b;
-	out.next = NULL;
-
 #if defined nginx_version && nginx_version >= 8011
 	r->main->count--;
 #endif
 
-	ctx->output_status = ngx_http_output_filter(r, &out);
+	ctx->output_status = ngx_http_output_filter(r, out);
 	return;
 
 local_failed:
@@ -2049,16 +2098,14 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 
 			n = c->recv(c, rb->buf->last, size);
 
-			ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
-				"http client request body recv %z", n);
+			ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "Http client request body recv %z", n);
 
 			if (n == NGX_AGAIN) {
 				break;
 			}
 
 			if (n == 0) {
-				ngx_log_error(NGX_LOG_INFO, c->log, 0,
-					"client closed prematurely connection");
+				ngx_log_error(NGX_LOG_INFO, c->log, 0, "Client closed prematurely connection");
 			}
 
 			if (n == 0 || n == NGX_ERROR) {
@@ -2098,8 +2145,7 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 			}
 		}
 
-		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
-			"http client request body rest %uz", rb->rest);
+		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "http client request body rest %uz", rb->rest);
 
 		if (rb->rest == 0) {
 			break;
@@ -2170,8 +2216,7 @@ ngx_http_read_log_collection_client_request_body_handler(ngx_http_request_t *r)
 	} else {
 		if (r->connection->read->delayed) {
 			clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
-			ngx_log_debug0(NGX_LOG_DEBUG_HTTP, rev->log, 0,
-				"http read delayed");
+			ngx_log_debug0(NGX_LOG_DEBUG_HTTP, rev->log, 0, "Http read delayed");
 
 			if (ngx_handle_read_event(rev, clcf->send_lowat) != NGX_OK) {
 				ngx_http_log_collection_finalization(ctx);
@@ -2254,7 +2299,7 @@ ngx_http_read_log_collection_client_request_body(ngx_http_request_t *r, ngx_http
 		/* there is the pre-read part of the request body */
 
 		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-			"http client request body preread %uz", preread);
+			"Http client request body preread %uz", preread);
 
 		ctx->received = preread;
 
@@ -2306,7 +2351,7 @@ ngx_http_read_log_collection_client_request_body(ngx_http_request_t *r, ngx_http
 	}
 
 	if (rb->rest < 0) {
-		ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, "negative request body rest");
+		ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, "Negative request body rest");
 		rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
 		goto done;
 	}
@@ -2377,14 +2422,13 @@ ngx_http_log_collection_find_special_header(ngx_http_log_collection_ctx_t *ctx, 
 		if (ngx_strncasecmp(header[i].key.data,	h->data, h->len) == 0) {
 			ctx->client_uuid = header[i].value;
 
-			if (ctx->client_uuid.len != 36
+			if (ctx->client_uuid.len != UUID_STRING_LENGTH
 				|| ctx->client_uuid.data[8] != '-'
 				|| ctx->client_uuid.data[13] != '-'
 				|| ctx->client_uuid.data[18] != '-'
 				|| ctx->client_uuid.data[23] != '-')
 			{
-				ngx_log_error(NGX_LOG_ERR, ctx->log, 0,
-					"Invalid UUID format: %V", &ctx->client_uuid);
+				ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Invalid UUID format: %V", &ctx->client_uuid);
 				return NGX_ERROR;
 			}
 
@@ -2420,7 +2464,7 @@ ngx_http_log_collection_parse_request_headers(ngx_http_log_collection_ctx_t *ctx
 
 	if (headers_in->content_type == NULL) {
 		ngx_log_error(NGX_LOG_ERR, ctx->log, ngx_errno,
-			"missing Content-Type or Content-Length header");
+			"Missing Content-Type or Content-Length header");
 
 		err = NGX_HTTP_BAD_REQUEST;
 		goto failed;
@@ -2442,7 +2486,7 @@ ngx_http_log_collection_parse_request_headers(ngx_http_log_collection_ctx_t *ctx
 	rc = ngx_http_log_collection_find_special_header(ctx, &to_find_str);
 
 	if (rc != NGX_OK) {
-		ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "missing Client-UUID header");
+		ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Missing Client-UUID header");
 
 		err = NGX_HTTP_BAD_REQUEST;
 		goto failed;
@@ -2678,7 +2722,7 @@ ngx_http_test_expect(ngx_http_request_t *r)
 		return NGX_OK;
 	}
 
-	ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "send 100 Continue");
+	ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "Send 100 Continue");
 
 	n = r->connection->send(r->connection, (u_char *) "HTTP/1.1 100 Continue" CRLF CRLF,
 		sizeof("HTTP/1.1 100 Continue" CRLF CRLF) - 1);
