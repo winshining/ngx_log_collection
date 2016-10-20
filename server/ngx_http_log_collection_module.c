@@ -69,6 +69,9 @@
  * Add content length in normal response.
  * Optimize code.
  * Code on 2016-10-17 & 2016-10-18.
+ * 
+ * Fix the compatibility problem.
+ * Code on 2016-10-21.
  */
 #include <ngx_config.h>
 #include <ngx_core.h>
@@ -250,7 +253,9 @@ static ngx_int_t ngx_http_log_collection_process_request_body(ngx_http_request_t
 static ngx_int_t ngx_http_log_collection_request_body_filter(ngx_http_request_t *r, ngx_chain_t *in);
 
 static ngx_int_t ngx_http_log_collection_request_body_length_filter(ngx_http_request_t *r, ngx_chain_t *in);
+#if defined nginx_version && nginx_version >= 1003009
 static ngx_int_t ngx_http_log_collection_request_body_chunked_filter(ngx_http_request_t *r, ngx_chain_t *in);
+#endif
 
 static char *ngx_http_log_collection(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void *ngx_http_log_collection_create_loc_conf(ngx_conf_t *cf);
@@ -428,11 +433,15 @@ ngx_module_t ngx_http_log_collection_module = {
 ngx_int_t
 ngx_http_log_collection_request_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
+#if defined nginx_version && nginx_version >= 1003009
 	if (r->headers_in.chunked) {
 		return ngx_http_log_collection_request_body_chunked_filter(r, in);
 	} else {
+#endif
 		return ngx_http_log_collection_request_body_length_filter(r, in);
+#if defined nginx_version && nginx_version >= 1003009
 	}
+#endif
 }
 
 ngx_int_t
@@ -460,10 +469,22 @@ ngx_http_log_collection_request_body_length_filter(ngx_http_request_t *r, ngx_ch
 			break;
 		}
 
+#if defined nginx_version && nginx_version >= 1003009
 		tl = ngx_chain_get_free_buf(r->pool, &rb->free);
+#else
+		tl = ngx_pcalloc(r->pool, sizeof(ngx_chain_t));
+#endif
 		if (tl == NULL) {
 			return NGX_HTTP_INTERNAL_SERVER_ERROR;
 		}
+
+#if defined nginx_version && nginx_version < 1003009
+		tl->buf = ngx_calloc_buf(r->pool);
+
+		if (tl->buf == NULL) {
+			return NGX_HTTP_INTERNAL_SERVER_ERROR;
+		}
+#endif
 
 		b = tl->buf;
 
@@ -494,12 +515,15 @@ ngx_http_log_collection_request_body_length_filter(ngx_http_request_t *r, ngx_ch
 
 	rc = ngx_http_log_collection_process_request_body(r, out);
 
+#if defined nginx_version && nginx_version >= 1003009
 	ngx_chain_update_chains(r->pool, &rb->free, &rb->busy, &out,
 		(ngx_buf_tag_t) &ngx_http_read_client_request_body);
+#endif
 
 	return rc;
 }
 
+#if defined nginx_version && nginx_version >= 1003009
 ngx_int_t
 ngx_http_log_collection_request_body_chunked_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
@@ -635,6 +659,7 @@ ngx_http_log_collection_request_body_chunked_filter(ngx_http_request_t *r, ngx_c
 
 	return rc;
 }
+#endif
 
 ngx_int_t
 ngx_http_log_collection_add_variables(ngx_conf_t *cf)
@@ -1420,7 +1445,7 @@ ngx_http_log_collection_process_output_buffer_handler(ngx_http_log_collection_ct
 				/* form name found */
 				if (*s == '=' || s == e) {
 					size = s - data->last_form_name_pos;
-					data->form_state = log_collection_form_value;
+					data->form_state = (*s == '=') ? log_collection_form_value : log_collection_form_name;
 
 					if (ctx->redirect_to_backend) {
 						cl = ngx_pcalloc(ctx->request->pool, sizeof(ngx_chain_t));
@@ -2066,9 +2091,11 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 						return NGX_HTTP_INTERNAL_SERVER_ERROR;
 				}
 
+#if defined nginx_version && nginx_version >= 1003009
 				if (rb->busy != NULL) {
 					return NGX_HTTP_INTERNAL_SERVER_ERROR;
 				}
+#endif
 
 				rb->buf->pos = rb->buf->start;
 				rb->buf->last = rb->buf->start;
@@ -2278,7 +2305,11 @@ ngx_http_read_log_collection_client_request_body(ngx_http_request_t *r, ngx_http
 
 	r->request_body = rb;
 
-	if (r->headers_in.content_length_n < 0 && !r->headers_in.chunked) {
+	if (r->headers_in.content_length_n < 0
+#if defined nginx_version && nginx_version >= 1003009
+		&& !r->headers_in.chunked
+#endif
+			) {
 		post_handler(r);
 		return ctx->output_status;
 	}
@@ -2312,8 +2343,11 @@ ngx_http_read_log_collection_client_request_body(ngx_http_request_t *r, ngx_http
 
 		r->request_length += preread - (r->header_in->last - r->header_in->pos);
 
-		if (!r->headers_in.chunked
-			&& rb->rest > 0
+		if (
+#if defined nginx_version && nginx_version >= 1003009
+			!r->headers_in.chunked &&
+#endif
+			rb->rest > 0
 			&& rb->rest <= (off_t) (r->header_in->end - r->header_in->last))
 		{
 			/* the whole request body may be placed in r->header_in */
@@ -2361,7 +2395,11 @@ ngx_http_read_log_collection_client_request_body(ngx_http_request_t *r, ngx_http
 	size = clcf->client_body_buffer_size;
 	size += size >> 2;
 
-	if (!r->headers_in.chunked && rb->rest < (off_t) size) {
+	if (
+#if defined nginx_version && nginx_version >= 1003009
+		!r->headers_in.chunked &&
+#endif
+		rb->rest < (off_t) size) {
 		size = (ssize_t) rb->rest;
 
 		if (r->request_body_in_single_buf) {
