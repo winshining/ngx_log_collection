@@ -1,78 +1,10 @@
 /*
- * For batch clients test log collection.
- * Version 1.0:
- * Happy road version.
- * First code on 2011-07-15.
- *
- * Version 1.1:
- * Add cleanup.
- * Fix bugs.
- * Code on 2011-07-20.
- *
- * Version 1.2:
- * Rename log file to a new one if it reaches the max size.
- * Add processing of Expect.
- * Code on 2011-07-22.
- *
- * Version 1.3:
- * Fix bugs: add "ctx->main->count--;" in post_handler.
- * Code on 2011-07-25.
- *
- * Version 1.4:
- * Add urldecode.
- * Fix bugs.
- * Code on 2011-07-26.
- * 
- * Version 1.5:
- * Add backend processing.
- * Code on 2011-07-29.
- *
- * Version 1.6:
- * Fix bug: parse log_collection, add "cf->args->nelts == 3".
- * Fix bug: if redirect_to_backend is 0, do not run script
- * Code on 2011-08-10.
- *
- * Version 1.7:
- * Open or close urldecode depends on nginx.conf.
- * Code on 2011-08-12.
- *
- * Version 2.0:
- * Add compatibility for versions above 1.3.9.
- * Code on 2016-03-28.
- * 
- * Fix a bug: initialize rc = NGX_OK in ngx_http_log_collection_post_handler.
- * Code on 2016-06-10.
- *
- * Fix a bug: initialize rest = 0 in ngx_http_log_collection_flush_to_file.
- * Code on 2016-09-26.
- *
- * Version 2.1:
- * Recode body reading functionality,
- * refering to https://github.com/hongzhidao/nginx-upload-module, many thanks.
- * Code on 2016-10-09.
- *
- * Version 2.2:
- * Rename some functions and variables in order to be easily.
- * Add data purification.
- * Code on 2016-10-11.
- *
- * Version 2.3:
- * Beautify the code.
- * Add backend processing depends on the upload content.
- * Code on 2016-10-15.
- *
- * Version 2.4:
- * Fix a bug: if redirect to backend disabled, nothing stored.
- * Fix a bug: urldecode ' ' -> '+'
- * Code on 2016-10-16.
- *
- * Add content length in normal response.
- * Optimize code.
- * Code on 2016-10-17 & 2016-10-18.
- * 
- * Fix the compatibility problem.
- * Code on 2016-10-21.
+ * Copyright (C) winshining 2016 https://github.com/winshining
+ * Copyright (C) 2006, 2008 Valery Kholodkov
+ * Copyright (C) 2002-2016 Igor Sysoev
+ * Copyright (C) 2011-2016 Nginx, Inc.
  */
+
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
@@ -500,13 +432,13 @@ ngx_http_log_collection_request_body_length_filter(ngx_http_request_t *r, ngx_ch
 		size = cl->buf->last - cl->buf->pos;
 
 		if ((off_t) size < rb->rest) {
-		    cl->buf->pos = cl->buf->last;
+			cl->buf->pos = cl->buf->last;
 			rb->rest -= size;
 		} else {
-		    cl->buf->pos += (size_t) rb->rest;
+			cl->buf->pos += (size_t) rb->rest;
 			rb->rest = 0;
-		    b->last = cl->buf->pos;
-		    b->last_buf = 1;
+			b->last = cl->buf->pos;
+			b->last_buf = 1;
 		}
 
 		*ll = tl;
@@ -1445,7 +1377,10 @@ ngx_http_log_collection_process_output_buffer_handler(ngx_http_log_collection_ct
 				/* form name found */
 				if (*s == '=' || s == e) {
 					size = s - data->last_form_name_pos;
-					data->form_state = (*s == '=') ? log_collection_form_value : log_collection_form_name;
+
+					if (*s == '=') {
+						data->form_state =  log_collection_form_value;
+					}
 
 					if (ctx->redirect_to_backend) {
 						cl = ngx_pcalloc(ctx->request->pool, sizeof(ngx_chain_t));
@@ -2074,6 +2009,7 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 				/* pass buffer to request body filter chain */
 				out.buf = rb->buf;
 				out.next = NULL;
+				*out.buf->last = '\0';
 
 				rc = ngx_http_log_collection_request_body_filter(r, &out);
 
@@ -2147,6 +2083,7 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 			if (n == rest) {
 				out.buf = rb->buf;
 				out.next = NULL;
+				*out.buf->last = '\0';
 
 				if ((rc = ngx_http_log_collection_request_body_filter(r, &out)) != NGX_OK) {
 					return rc;
@@ -2336,6 +2273,7 @@ ngx_http_read_log_collection_client_request_body(ngx_http_request_t *r, ngx_http
 
 		out.buf = r->header_in;
 		out.next = NULL;
+		*out.buf->last = '\0';
 
 		if ((rc = ngx_http_log_collection_request_body_filter(r, &out)) != NGX_OK) {
 			goto done;
