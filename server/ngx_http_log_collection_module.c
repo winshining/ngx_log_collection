@@ -1,5 +1,6 @@
 /*
- * Copyright (C) winshining 2016 https://github.com/winshining
+ * Copyright (C) 2016 hongzhidao https://github.com/hongzhidao
+ * Copyright (C) 2016-2017 winshining https://github.com/winshining
  * Copyright (C) 2006, 2008 Valery Kholodkov
  * Copyright (C) 2002-2016 Igor Sysoev
  * Copyright (C) 2011-2016 Nginx, Inc.
@@ -31,6 +32,7 @@
 #define NGX_LOG_COLLECTION_IOERROR		-3
 #define NGX_LOG_COLLECTION_TOOLARGE		-4
 #define NGX_LOG_COLLECTION_SCRIPTERROR	-5
+#define NGX_LOG_COLLECTION_BADPROTOCOL	-6
 
 typedef enum {
 	log_collection_state_header,
@@ -185,9 +187,6 @@ static ngx_int_t ngx_http_log_collection_process_request_body(ngx_http_request_t
 static ngx_int_t ngx_http_log_collection_request_body_filter(ngx_http_request_t *r, ngx_chain_t *in);
 
 static ngx_int_t ngx_http_log_collection_request_body_length_filter(ngx_http_request_t *r, ngx_chain_t *in);
-#if defined nginx_version && nginx_version >= 1003009
-static ngx_int_t ngx_http_log_collection_request_body_chunked_filter(ngx_http_request_t *r, ngx_chain_t *in);
-#endif
 
 static char *ngx_http_log_collection(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void *ngx_http_log_collection_create_loc_conf(ngx_conf_t *cf);
@@ -367,7 +366,7 @@ ngx_http_log_collection_request_body_filter(ngx_http_request_t *r, ngx_chain_t *
 {
 #if defined nginx_version && nginx_version >= 1003009
 	if (r->headers_in.chunked) {
-		return ngx_http_log_collection_request_body_chunked_filter(r, in);
+		return NGX_LOG_COLLECTION_BADPROTOCOL;
 	} else {
 #endif
 		return ngx_http_log_collection_request_body_length_filter(r, in);
@@ -454,144 +453,6 @@ ngx_http_log_collection_request_body_length_filter(ngx_http_request_t *r, ngx_ch
 
 	return rc;
 }
-
-#if defined nginx_version && nginx_version >= 1003009
-ngx_int_t
-ngx_http_log_collection_request_body_chunked_filter(ngx_http_request_t *r, ngx_chain_t *in)
-{
-    size_t						size;
-    ngx_int_t					rc;
-    ngx_buf_t					*b;
-    ngx_chain_t					*cl, *out, *tl, **ll;
-    ngx_http_request_body_t		*rb;
-    ngx_http_core_loc_conf_t	*clcf;
-
-    rb = r->request_body;
-
-    if (rb->rest == -1) {
-		ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-			"Http request body chunked filter");
-
-		rb->chunked = ngx_pcalloc(r->pool, sizeof(ngx_http_chunked_t));
-		if (rb->chunked == NULL) {
-			return NGX_HTTP_INTERNAL_SERVER_ERROR;
-		}
-
-		r->headers_in.content_length_n = 0;
-		rb->rest = 3;
-    }
-
-	out = NULL;
-	ll = &out;
-
-	for (cl = in; cl; cl = cl->next) {
-		for ( ;; ) {
-			ngx_log_debug7(NGX_LOG_DEBUG_EVENT, r->connection->log, 0,
-				"Http body chunked buf "
-				"t:%d f:%d %p, pos %p, size: %z file: %O, size: %z",
-				cl->buf->temporary, cl->buf->in_file,
-				cl->buf->start, cl->buf->pos,
-				cl->buf->last - cl->buf->pos,
-				cl->buf->file_pos,
-				cl->buf->file_last - cl->buf->file_pos);
-
-			rc = ngx_http_parse_chunked(r, cl->buf, rb->chunked);
-
-			if (rc == NGX_OK) {
-				/* a chunk has been parsed successfully */
-				clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
-
-				if (clcf->client_max_body_size
-					&& clcf->client_max_body_size
-					< r->headers_in.content_length_n + rb->chunked->size)
-				{
-					ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-						"Client intended to send too large chunked "
-						"body: %O bytes",
-						r->headers_in.content_length_n
-						+ rb->chunked->size);
-
-					r->lingering_close = 1;
-
-					return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
-				}
-
-				tl = ngx_chain_get_free_buf(r->pool, &rb->free);
-				if (tl == NULL) {
-					return NGX_HTTP_INTERNAL_SERVER_ERROR;
-				}
-
-				b = tl->buf;
-
-				ngx_memzero(b, sizeof(ngx_buf_t));
-
-				b->temporary = 1;
-				b->tag = (ngx_buf_tag_t) &ngx_http_read_client_request_body;
-				b->start = cl->buf->start;
-				b->pos = cl->buf->pos;
-				b->last = cl->buf->last;
-				b->end = cl->buf->end;
-
-				*ll = tl;
-				ll = &tl->next;
-
-				size = cl->buf->last - cl->buf->pos;
-
-				if ((off_t) size > rb->chunked->size) {
-					cl->buf->pos += rb->chunked->size;
-					r->headers_in.content_length_n += rb->chunked->size;
-					rb->chunked->size = 0;
-				} else {
-					rb->chunked->size -= size;
-					r->headers_in.content_length_n += size;
-					cl->buf->pos = cl->buf->last;
-				}
-
-				b->last = cl->buf->pos;
-				continue;
-			}
-
-			if (rc == NGX_DONE) {
-				/* a whole response has been parsed successfully */
-
-				rb->rest = 0;
-
-				tl = ngx_chain_get_free_buf(r->pool, &rb->free);
-				if (tl == NULL) {
-					return NGX_HTTP_INTERNAL_SERVER_ERROR;
-				}
-
-				b = tl->buf;
-				ngx_memzero(b, sizeof(ngx_buf_t));
-				b->last_buf = 1;
-
-				*ll = tl;
-				ll = &tl->next;
-				break;
-			}
-
-			if (rc == NGX_AGAIN) {
-				/* set rb->rest, amount of data we want to see next time */
-
-				rb->rest = rb->chunked->length;
-				break;
-			}
-
-			/* invalid */
-			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Client sent invalid chunked body");
-
-			return NGX_HTTP_BAD_REQUEST;
-		}
-	}
-
-	rc = ngx_http_log_collection_process_request_body(r, out);
-
-	ngx_chain_update_chains(r->pool, &rb->free, &rb->busy, &out,
-		(ngx_buf_tag_t) &ngx_http_read_client_request_body);
-
-	return rc;
-}
-#endif
 
 ngx_int_t
 ngx_http_log_collection_add_variables(ngx_conf_t *cf)
@@ -2022,6 +1883,8 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 						return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
 					case NGX_LOG_COLLECTION_IOERROR:
 						return NGX_HTTP_SERVICE_UNAVAILABLE;
+					case NGX_LOG_COLLECTION_BADPROTOCOL:
+						return NGX_HTTP_NOT_IMPLEMENTED;
 					case NGX_LOG_COLLECTION_NOMEM:
 					default:
 						return NGX_HTTP_INTERNAL_SERVER_ERROR;
