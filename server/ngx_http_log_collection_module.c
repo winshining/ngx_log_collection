@@ -86,7 +86,6 @@ typedef struct ngx_http_log_collection_loc_conf_s {
 	ngx_array_t	*field_templates; /* ngx_http_log_collection_field_template_t */
 	ngx_flag_t	forward_args;
 
-	size_t		output_buffer_size;
 	off_t		max_file_size;
 	size_t		max_request_body_size;
 	size_t		upload_limit_rate;
@@ -164,8 +163,7 @@ typedef struct ngx_http_log_collection_ctx_s {
 	ssize_t						received;
 
 	u_char						*output_buffer;
-	u_char						*output_buffer_pos;
-	u_char						*output_buffer_end;
+	off_t						output_buffer_len;
 
 	ngx_str_t					client_uuid;
 	ngx_int_t					output_status;
@@ -173,15 +171,14 @@ typedef struct ngx_http_log_collection_ctx_s {
 	ngx_http_log_collection_backend_handler_pt backend_handler;
 	void						*backend_handler_data; /* for backend_handler */
 	unsigned int				redirect_to_backend:1;
-	unsigned int				discard_data:1; 
 } ngx_http_log_collection_ctx_t;
 
 /*
  * If store path not specified, use this one
  */
-// static ngx_path_init_t ngx_http_log_collection_temp_path = {
-//	ngx_string(NGX_HTTP_CLIENT_TEMP_PATH), { 1, 0, 0 }
-// };
+static ngx_path_init_t ngx_http_log_collection_temp_path = {
+	ngx_string(NGX_HTTP_CLIENT_TEMP_PATH), { 0, 0, 0 }
+};
 
 static ngx_int_t ngx_http_log_collection_process_request_body(ngx_http_request_t *r, ngx_chain_t *body);
 static ngx_int_t ngx_http_log_collection_request_body_filter(ngx_http_request_t *r, ngx_chain_t *in);
@@ -281,14 +278,6 @@ static ngx_command_t ngx_http_log_collection_commands[] = {
 		ngx_conf_set_size_slot,
 		NGX_HTTP_LOC_CONF_OFFSET,
 		offsetof(ngx_http_log_collection_loc_conf_t, max_request_body_size),
-		NULL
-	},
-	{
-		ngx_string("output_buffer_size"),
-		NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
-		ngx_conf_set_size_slot,
-		NGX_HTTP_LOC_CONF_OFFSET,
-		offsetof(ngx_http_log_collection_loc_conf_t, output_buffer_size),
 		NULL
 	},
 	/*
@@ -914,15 +903,29 @@ ngx_http_log_collection_open_file(ngx_http_log_collection_ctx_t *ctx)
  * ngx_http_log_collection_process_max_file
  */
 static ngx_int_t
-ngx_http_log_collection_process_max_file(ngx_http_log_collection_ctx_t* ctx,
-			ngx_file_t *file, u_char *buf, size_t len)
+ngx_http_log_collection_process_max_file(ngx_http_log_collection_ctx_t* ctx, ngx_file_t *file,
+	u_char *buf, size_t len, ngx_flag_t max)
 {
 	struct timeval						tp;
 	ngx_tm_t							tm;
 	ngx_str_t							new_filename;
 
-	ngx_gettimeofday(&tp);
-	ngx_localtime(tp.tv_sec, &tm);
+	if (len > 0) {
+	    if (ngx_write_file(&ctx->output_file, buf, len,
+			ctx->output_file.offset) == NGX_ERROR)
+		{
+			ngx_log_error(NGX_LOG_ERR, ctx->log, ngx_errno,
+				"Write to file \"%V\" failed", &ctx->output_file.name);
+			return NGX_LOG_COLLECTION_IOERROR;
+		}
+	}
+
+	/* Not exceeded the max size */
+	if (max == 0) {
+		return NGX_OK;
+	}
+
+	ngx_close_file(ctx->output_file.fd);
 
 	/* filename-1970_01_01_00_00_00_0000000000 */
 	new_filename.len = ctx->output_file.name.len + ngx_strlen(FILE_POSTFIX_FORMAT) +
@@ -934,7 +937,8 @@ ngx_http_log_collection_process_max_file(ngx_http_log_collection_ctx_t* ctx,
 		ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Allocate space for renaming file failed.");
 		return NGX_LOG_COLLECTION_NOMEM;
 	} else {
-		ngx_close_file(ctx->output_file.fd);
+		ngx_gettimeofday(&tp);
+		ngx_localtime(tp.tv_sec, &tm);
 
 		ngx_sprintf(new_filename.data, "%V%Z", &ctx->output_file.name);
 		ngx_sprintf(new_filename.data + ngx_strlen(ctx->output_file.name.data),
@@ -955,14 +959,6 @@ ngx_http_log_collection_process_max_file(ngx_http_log_collection_ctx_t* ctx,
 		}
 
 		ctx->output_file.offset = 0;
-
-		if(ngx_write_file(&ctx->output_file, buf, len,
-						ctx->output_file.offset) == NGX_ERROR)
-		{
-			ngx_log_error(NGX_LOG_ERR, ctx->log, ngx_errno,
-				"Write to file \"%V\" failed", &ctx->output_file.name);
-			return NGX_LOG_COLLECTION_IOERROR;
-		}
 	}
 
 	return NGX_OK;
@@ -977,35 +973,51 @@ ngx_http_log_collection_flush_to_file(ngx_http_log_collection_ctx_t *ctx)
 	ngx_http_log_collection_loc_conf_t	*lclcf;
 	off_t								len;
 	u_char								*buf;
-	size_t								rest = 0;
-	ngx_int_t							rc  = NGX_OK;
+	size_t								delta;
+	ngx_int_t							rc = NGX_OK;
 	ngx_flag_t							max = 0;
 
-	if (ctx->output_buffer_pos > ctx->output_buffer) {
-		lclcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_log_collection_module);
+	if (ctx->output_buffer == NULL) {
+		return rc;
+	}
 
-		buf = ctx->output_buffer;
-		len = (off_t) (ctx->output_buffer_pos - ctx->output_buffer);
+	lclcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_log_collection_module);
 
-		if(lclcf->max_file_size != 0) {
-			if(ctx->output_file.offset + len > lclcf->max_file_size) {
-				len = lclcf->max_file_size - ctx->output_file.offset;
-				rest = ctx->output_buffer_pos - ctx->output_buffer - len;
-				max = 1;
-			}
-		}
+	buf = ctx->output_buffer;
+	len = ctx->output_buffer_len;
 
-		if(ngx_write_file(&ctx->output_file, buf, len,
-						ctx->output_file.offset) == NGX_ERROR)
+	if (lclcf->max_file_size == 0 || len + ctx->output_file.offset <= lclcf->max_file_size) {
+		if (ngx_write_file(&ctx->output_file, buf, len,
+			ctx->output_file.offset) == NGX_ERROR)
 		{
 			ngx_log_error(NGX_LOG_ERR, ctx->log, ngx_errno,
 				"Write to file \"%V\" failed", &ctx->output_file.name);
 			rc = NGX_LOG_COLLECTION_IOERROR;
 		}
+	} else {
+		while (len > 0) {
+			if (len + ctx->output_file.offset >= lclcf->max_file_size) {
+				max = 1;
 
-		if (max && rc == NGX_OK) {
-			buf += len;
-			rc = ngx_http_log_collection_process_max_file(ctx, &ctx->output_file, buf, rest);
+				/* The size of file to be written is already bigger than the max file size */
+				if (ctx->output_file.offset >= lclcf->max_file_size) {
+					delta = 0;
+				} else {
+					delta = lclcf->max_file_size - ctx->output_file.offset;
+				}
+			} else {
+				max = 0;
+				delta = len;
+			}
+
+			rc = ngx_http_log_collection_process_max_file(ctx, &ctx->output_file, buf, delta, max);
+			if (rc != NGX_OK) {
+				rc = NGX_LOG_COLLECTION_IOERROR;
+				break;
+			}
+
+			buf += delta;
+			len -= delta;
 		}
 	}
 
@@ -1448,74 +1460,68 @@ ngx_http_log_collection_decode_output_buffer_handler(ngx_http_log_collection_ctx
 	ngx_http_log_collection_process_request_body_data_t *prd = ctx->process_handler_data;
 	ngx_http_log_collection_backend_data_t *bd = ctx->backend_handler_data;
 
-	if (ctx->discard_data == 0) {
-		if (prd->decode_output_buffer_handler_data == NULL) {
-			dob = ngx_pcalloc(ctx->request->pool, 
-				sizeof(ngx_http_log_collection_decode_output_buffer_data_t) + 3);
+	if (prd->decode_output_buffer_handler_data == NULL) {
+		dob = ngx_pcalloc(ctx->request->pool, 
+			sizeof(ngx_http_log_collection_decode_output_buffer_data_t) + 3);
 
-			if (dob == NULL) {
-				ctx->discard_data = 1;
-				return NGX_LOG_COLLECTION_NOMEM;
-			}
-
-			dob->pool = ctx->request->pool;
-			prd->decode_output_buffer_handler_data = (void *) dob;
-			dob->buffer_handler = ngx_http_log_collection_process_buffer_handler;
-		} else {
-			dob = prd->decode_output_buffer_handler_data;
+		if (dob == NULL) {
+			return NGX_LOG_COLLECTION_NOMEM;
 		}
 
-		/* this was a '%' or '%X' in output_buffer last receive */
-		if (dob->need) {
-			if (ctx->written_length == ctx->body_length - (3 - (size_t) dob->need)) {
-				ctx->written_length += 3 - (size_t) dob->need;
-				*end = *start;
+		dob->pool = ctx->request->pool;
+		prd->decode_output_buffer_handler_data = (void *) dob;
+		dob->buffer_handler = ngx_http_log_collection_process_buffer_handler;
+	} else {
+		dob = prd->decode_output_buffer_handler_data;
+	}
 
-				if (ctx->redirect_to_backend) {
-					bd->text_len_n += 3 - (size_t) dob->need;
-				}
-
-				if (dob->buffer_handler) {
-					return dob->buffer_handler(ctx, dob->left, 3 - (size_t) dob->need);
-				}
-			}
-
-			(void) ngx_memcpy(dob->left + 3 - (size_t) dob->need, *start, (size_t) dob->need);
-			ngx_http_log_collection_do_urldecode(dob->left, &l);
-
-			if (dob->buffer_handler) {
-				(void) dob->buffer_handler(ctx, dob->left, l);
-			}
+	/* this was a '%' or '%X' in output_buffer last receive */
+	if (dob->need) {
+		if (ctx->written_length == ctx->body_length - (3 - (size_t) dob->need)) {
+			ctx->written_length += 3 - (size_t) dob->need;
+			*end = *start;
 
 			if (ctx->redirect_to_backend) {
 				bd->text_len_n += 3 - (size_t) dob->need;
 			}
 
-			ctx->written_length += 3 - (size_t) dob->need;
-			pos += (size_t) dob->need;
-			len -= (size_t) dob->need;
-			dob->need = 0;
+			if (dob->buffer_handler) {
+				return dob->buffer_handler(ctx, dob->left, 3 - (size_t) dob->need);
+			}
 		}
 
-		rc = ngx_http_log_collection_urldecode(dob, *start + pos, &len);
-		if (rc != NGX_OK) {
-			ctx->discard_data = 1;
-			return rc;
-		}
+		(void) ngx_memcpy(dob->left + 3 - (size_t) dob->need, *start, (size_t) dob->need);
+		ngx_http_log_collection_do_urldecode(dob->left, &l);
 
 		if (dob->buffer_handler) {
-			rc = dob->buffer_handler(ctx, *start + pos, dob->decoded_length);
-			dob->decoded_length = 0;
+			(void) dob->buffer_handler(ctx, dob->left, l);
 		}
 
-		if (dob->need) {
-			*end -= 3 - (size_t) dob->need;
+		if (ctx->redirect_to_backend) {
+			bd->text_len_n += 3 - (size_t) dob->need;
 		}
 
+		ctx->written_length += 3 - (size_t) dob->need;
+		pos += (size_t) dob->need;
+		len -= (size_t) dob->need;
+		dob->need = 0;
+	}
+
+	rc = ngx_http_log_collection_urldecode(dob, *start + pos, &len);
+	if (rc != NGX_OK) {
 		return rc;
 	}
 
-	return NGX_OK;
+	if (dob->buffer_handler) {
+		rc = dob->buffer_handler(ctx, *start + pos, dob->decoded_length);
+		dob->decoded_length = 0;
+	}
+
+	if (dob->need) {
+		*end -= 3 - (size_t) dob->need;
+	}
+
+	return rc;
 }
 
 /*
@@ -1524,15 +1530,11 @@ ngx_http_log_collection_decode_output_buffer_handler(ngx_http_log_collection_ctx
 static void
 ngx_http_log_collection_finish_file(ngx_http_log_collection_ctx_t *ctx)
 {
-	ngx_http_log_collection_cleanup_t  *lccln;
+	ngx_http_log_collection_cleanup_t *lccln = ctx->cln->data;
 
-	if (ctx->discard_data == 0) {
-		(void) ngx_http_log_collection_flush_to_file(ctx);
-	}
-
-	ctx->discard_data = 0;
-	lccln = ctx->cln->data;
 	lccln->fd = -1;
+
+	(void) ngx_http_log_collection_flush_to_file(ctx);
 	ngx_close_file(ctx->output_file.fd);
 }
 
@@ -1558,56 +1560,29 @@ ngx_http_log_collection_finalization(ngx_http_log_collection_ctx_t *ctx)
 {
 	if (ctx != NULL) {
 		if (ctx->state == log_collection_state_data) {
-			if (ctx->discard_data == 0) {
-				(void) ngx_http_log_collection_flush_to_file(ctx);
-			}
-
+			(void) ngx_http_log_collection_flush_to_file(ctx);
 			ngx_http_log_collection_abort_file(ctx);
 		}
 	}
 }
 
 /*
- * Copy client request body to buffer or write to file
+ * Write client request body to file
  */
 ngx_int_t
 ngx_http_log_collection_process_buffer_handler(ngx_http_log_collection_ctx_t *ctx, u_char *buffer, size_t len)
 {
 	ngx_int_t rc;
-	size_t buffer_pos = 0;
 
-	while (len >= (size_t) (ctx->output_buffer_end - ctx->output_buffer_pos)) {
-		(void) ngx_cpymem(ctx->output_buffer_pos, buffer + buffer_pos,
-					ctx->output_buffer_end - ctx->output_buffer_pos);
+	ctx->output_buffer = buffer;
+	ctx->output_buffer_len = len;
 
-		len -= ctx->output_buffer_end - ctx->output_buffer_pos;
-		buffer_pos += ctx->output_buffer_end - ctx->output_buffer_pos;
-		ctx->output_buffer_pos = ctx->output_buffer_end;
-
-		if (ctx->discard_data == 0) {
-			rc = ngx_http_log_collection_flush_to_file(ctx);
-			if (rc != NGX_OK) {
-				ctx->discard_data = 1;
-			}
-		}
-
-		ctx->output_buffer_pos = ctx->output_buffer;
+	rc = ngx_http_log_collection_flush_to_file(ctx);
+	if (rc != NGX_OK) {
+		ngx_http_log_collection_abort_file(ctx);
 	}
 
-	if (len > 0) {
-		ctx->output_buffer_pos = ngx_cpymem(ctx->output_buffer_pos, buffer + buffer_pos, len);
-		
-		if (ctx->output_buffer_pos == ctx->output_buffer_end) {
-			if (ctx->discard_data == 0) {
-				rc = ngx_http_log_collection_flush_to_file(ctx);
-				if (rc != NGX_OK) {
-					ctx->discard_data = 1;
-				}
-			}
-		}
-	}
-
-	return (ctx->discard_data == 0) ? NGX_OK : NGX_ERROR;
+	return rc;
 }
 
 /*
@@ -1657,10 +1632,13 @@ ngx_http_log_collection_process_request_body_handler(ngx_http_log_collection_ctx
 
 				if (rc != NGX_OK) {
 					ngx_http_log_collection_abort_file(ctx);
+					return rc;
 				}
 
 				ctx->written_length += end - start;
 				if (ctx->written_length >= ctx->body_length) {
+					ctx->output_buffer = NULL;
+					ctx->output_buffer_len = 0;
 					ctx->state = log_collection_state_finish;
 				} else {
 					if (data->log_content_decode) {
@@ -1873,21 +1851,10 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 				*out.buf->last = '\0';
 
 				rc = ngx_http_log_collection_request_body_filter(r, &out);
-
-				switch(rc) {
-					case NGX_OK:
-						break;
-					case NGX_LOG_COLLECTION_MALFORMED:
-						return NGX_HTTP_BAD_REQUEST;
-					case NGX_LOG_COLLECTION_TOOLARGE:
-						return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
-					case NGX_LOG_COLLECTION_IOERROR:
-						return NGX_HTTP_SERVICE_UNAVAILABLE;
-					case NGX_LOG_COLLECTION_BADPROTOCOL:
-						return NGX_HTTP_NOT_IMPLEMENTED;
-					case NGX_LOG_COLLECTION_NOMEM:
-					default:
-						return NGX_HTTP_INTERNAL_SERVER_ERROR;
+				if (rc != NGX_OK) {
+					goto failed;
+				} else {
+					break;
 				}
 
 #if defined nginx_version && nginx_version >= 1003009
@@ -1948,8 +1915,9 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 				out.next = NULL;
 				*out.buf->last = '\0';
 
-				if ((rc = ngx_http_log_collection_request_body_filter(r, &out)) != NGX_OK) {
-					return rc;
+				rc = ngx_http_log_collection_request_body_filter(r, &out);
+				if (rc != NGX_OK) {
+					goto failed;
 				}
 			}
 
@@ -2002,6 +1970,21 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 	rb->post_handler(r);
 
 	return ctx->output_status;
+
+failed:
+	switch(rc) {
+		case NGX_LOG_COLLECTION_MALFORMED:
+			return NGX_HTTP_BAD_REQUEST;
+		case NGX_LOG_COLLECTION_TOOLARGE:
+			return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+		case NGX_LOG_COLLECTION_IOERROR:
+			return NGX_HTTP_SERVICE_UNAVAILABLE;
+		case NGX_LOG_COLLECTION_BADPROTOCOL:
+			return NGX_HTTP_NOT_IMPLEMENTED;
+		case NGX_LOG_COLLECTION_NOMEM:
+		default:
+			return NGX_HTTP_INTERNAL_SERVER_ERROR;
+	}
 }
 
 /*
@@ -2138,7 +2121,8 @@ ngx_http_read_log_collection_client_request_body(ngx_http_request_t *r, ngx_http
 		out.next = NULL;
 		*out.buf->last = '\0';
 
-		if ((rc = ngx_http_log_collection_request_body_filter(r, &out)) != NGX_OK) {
+		if (ngx_http_log_collection_request_body_filter(r, &out) != NGX_OK) {
+			rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
 			goto done;
 		}
 
@@ -2358,7 +2342,6 @@ ngx_http_log_collection_create_loc_conf(ngx_conf_t *cf)
 	conf->log_content_decode = NGX_CONF_UNSET;
 	conf->log_content_purify = NGX_CONF_UNSET;
 	conf->upload_limit_rate = NGX_CONF_UNSET_SIZE;
-	conf->output_buffer_size = NGX_CONF_UNSET_SIZE;
 	conf->max_file_size = NGX_CONF_UNSET;
 	conf->max_request_body_size = NGX_CONF_UNSET_SIZE;
 
@@ -2375,13 +2358,12 @@ ngx_http_log_collection_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child
 	ngx_http_log_collection_loc_conf_t *prev = (ngx_http_log_collection_loc_conf_t *)parent;
 	ngx_http_log_collection_loc_conf_t *conf = (ngx_http_log_collection_loc_conf_t *)child;
 
-	// ngx_conf_merge_path_value(cf, &conf->store_path, prev->store_path, &ngx_http_log_collection_temp_path);
+	ngx_conf_merge_path_value(cf, &conf->store_path, prev->store_path, &ngx_http_log_collection_temp_path);
 	ngx_conf_merge_value(conf->all_in_single_folder, prev->all_in_single_folder, 0);
 	ngx_conf_merge_value(conf->log_content_decode, prev->log_content_decode, 1);
 	ngx_conf_merge_value(conf->log_content_purify, prev->log_content_purify, 1);
 	ngx_conf_merge_off_value(conf->max_file_size, prev->max_file_size, 0);
 	ngx_conf_merge_size_value(conf->max_request_body_size, prev->max_request_body_size, (size_t) 64 * 1024);
-	ngx_conf_merge_size_value(conf->output_buffer_size, prev->output_buffer_size, (size_t) 64 * 1024);
 	ngx_conf_merge_size_value(conf->upload_limit_rate, prev->upload_limit_rate, 0);
 
 	return NGX_CONF_OK;
@@ -2460,13 +2442,6 @@ ngx_http_log_collection_handler(ngx_http_request_t *r)
 		return rc;
 	}
 
-	ctx->output_buffer = ngx_pcalloc(ctx->request->pool, lclcf->output_buffer_size);
-	if (ctx->output_buffer == NULL) {
-		return NGX_HTTP_INTERNAL_SERVER_ERROR;
-	}
-
-	ctx->output_buffer_pos = ctx->output_buffer;
-	ctx->output_buffer_end = ctx->output_buffer + lclcf->output_buffer_size;
 	ctx->written_length    = 0;
 	ctx->upload_limit_rate = lclcf->upload_limit_rate;
 
