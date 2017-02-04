@@ -67,7 +67,7 @@ Fix a bug: urldecode ' ' -> '+'
 Code on 2016-10-16.
 
 Add content length in normal response.
-Optimize code.
+Optimize the code.
 Code on 2016-10-17 & 2016-10-18.
 
 Fix the compatibility problem.
@@ -84,4 +84,7 @@ Version 2.5:
 Optimize the writing log functionality.
 Fix some bugs.
 Code on 2017-02-03.
+
+Optimize the code.
+Code on 2017-02-04.
 

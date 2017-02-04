@@ -1,9 +1,9 @@
 /*
  * Copyright (C) 2016 hongzhidao https://github.com/hongzhidao
  * Copyright (C) 2016-2017 winshining https://github.com/winshining
- * Copyright (C) 2006, 2008 Valery Kholodkov
- * Copyright (C) 2002-2016 Igor Sysoev
- * Copyright (C) 2011-2016 Nginx, Inc.
+ * Copyright (C) 2006-2008 Valery Kholodkov
+ * Copyright (C) 2002-2017 Igor Sysoev
+ * Copyright (C) 2011-2017 Nginx, Inc.
  */
 
 #include <ngx_config.h>
@@ -118,7 +118,7 @@ typedef struct ngx_http_log_collection_backend_data_s {
 	ngx_chain_t				*last;
 } ngx_http_log_collection_backend_data_t;
 
-typedef ngx_int_t (*ngx_http_log_collection_process_output_buffer_handler_t)
+typedef ngx_int_t (*ngx_http_log_collection_process_output_buffer_handler_pt)
 		(struct ngx_http_log_collection_ctx_s *ctx, u_char **, u_char **);
 
 typedef ngx_int_t (*ngx_http_log_collection_decode_output_buffer_handler_pt)
@@ -130,11 +130,12 @@ typedef struct ngx_http_log_collection_process_request_body_s {
 	u_char							*last_form_name_pos;
 	u_char							*last_form_value_pos;
 
-	ngx_http_log_collection_process_output_buffer_handler_t process_output_buffer_handler;
-	unsigned int					log_content_purify:1;
-
+	ngx_http_log_collection_process_output_buffer_handler_pt process_output_buffer_handler;
 	ngx_http_log_collection_decode_output_buffer_handler_pt decode_output_buffer_handler;
+
+	unsigned int					log_content_purify:1;
 	unsigned int					log_content_decode:1;
+
 	void							*decode_output_buffer_handler_data;
 } ngx_http_log_collection_process_request_body_data_t;
 
@@ -647,12 +648,10 @@ ngx_http_log_collection_cleanup_handler(void *data)
 {
 	ngx_http_log_collection_cleanup_t *cln = data;
 
-	if (!cln->aborted) {
-		if (cln->fd >= 0) {
-			if (ngx_close_file(cln->fd) == NGX_FILE_ERROR) {
-				ngx_log_error(NGX_LOG_ERR, cln->log, ngx_errno,
-					ngx_close_file_n "\"%s\" failed", cln->filename);
-			}
+	if (!cln->aborted && cln->fd >= 0) {
+		if (ngx_close_file(cln->fd) == NGX_FILE_ERROR) {
+			ngx_log_error(NGX_LOG_ERR, cln->log, ngx_errno,
+				ngx_close_file_n "\"%s\" failed", cln->filename);
 		}
 	}
 }
@@ -1220,202 +1219,183 @@ ngx_http_log_collection_process_output_buffer_handler(ngx_http_log_collection_ct
 	data->last_form_value_pos = s;
 
 	while (s <= e) {
-		switch (data->form_state) {
-			case log_collection_form_name:
-				if (s == const_s) {
-					if (!data->form_name_flag) {
-						if (*s == '&' || *s == '=') {
-							ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Format is &xx or =xx");
-							return NGX_LOG_COLLECTION_MALFORMED;
-						}
+		if (data->form_state == log_collection_form_name) {
+			if (*s == '&') {
+				ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Format is &xx or x&x in the single buffer or xx& in the two buffers");
+				return NGX_LOG_COLLECTION_MALFORMED;
+			}
 
-						data->form_name_flag = 1;
-
-						if (ctx->redirect_to_backend) {
-							bd->text_len_n = 0;
-						}
-					} else {
-						if (*s == '&') {
-							ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Format is xx&");
-							return NGX_LOG_COLLECTION_MALFORMED;
-						}
-					}
-				}
-
-				if (*s == '&') {
-					ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Format is x&x= or x&x");
-					return NGX_LOG_COLLECTION_MALFORMED;
-				}
-
-				/* form name found */
-				if (*s == '=' || s == e) {
-					size = s - data->last_form_name_pos;
-
+			if (s == const_s) {
+				if (!data->form_name_flag) {
 					if (*s == '=') {
-						data->form_state =  log_collection_form_value;
+						ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Format is =xx in the single buffer");
+						return NGX_LOG_COLLECTION_MALFORMED;
 					}
+
+					data->form_name_flag = 1;
 
 					if (ctx->redirect_to_backend) {
-						cl = ngx_pcalloc(ctx->request->pool, sizeof(ngx_chain_t));
-						if (cl == NULL) {
-							ngx_log_error(NGX_LOG_ERR, ctx->log, 0,
-								"Alloc space for chain of the form name failed");
-							return NGX_HTTP_INTERNAL_SERVER_ERROR;
-						}
+						bd->text_len_n = 0;
+					}
+				}
+			}
 
-						cl->buf = ngx_create_temp_buf(ctx->request->pool, size);
-						if (cl->buf == NULL) {
-							ngx_log_error(NGX_LOG_ERR, ctx->log, 0,
-								"Alloc space for buf of the form name failed");
-							return NGX_HTTP_INTERNAL_SERVER_ERROR;
-						}
+			/* form name found */
+			if (*s == '=' || s == e) {
+				size = s - data->last_form_name_pos;
 
-						cl->buf->pos = cl->buf->start;
-						cl->buf->last = cl->buf->pos + size;
-						cl->buf->last_in_chain = 0;
-						cl->buf->last_buf = 0;
-
-						(void) ngx_cpymem(cl->buf->pos, data->last_form_name_pos, size);
-
-						if (*s == '=') {
-							cl->buf->last_in_chain = 1;
-							cl->buf->last_buf = 1;
-						}
-
-						cl->next = NULL;
-
-						if (!bd->field_name_chain) {
-							bd->field_name_chain = cl;
-							bd->current = bd->field_name_chain;
-						} else {
-							*bd->next = cl;
-							bd->current = *bd->next;
-						}
-
-						bd->next = &cl->next;
+				if (ctx->redirect_to_backend) {
+					cl = ngx_pcalloc(ctx->request->pool, sizeof(ngx_chain_t));
+					if (cl == NULL) {
+						ngx_log_error(NGX_LOG_ERR, ctx->log, 0,
+							"Alloc the space for the chain of form name failed");
+						return NGX_HTTP_INTERNAL_SERVER_ERROR;
 					}
 
-					if (!data->log_content_purify) {
-						/* no need to decode, for it is the form name  */
-						if (*s == '=' && s != e) {
-							size += 1;
-						}
-
-						rc = ngx_http_log_collection_process_buffer_handler(ctx,
-								data->last_form_name_pos, size);
+					cl->buf = ngx_create_temp_buf(ctx->request->pool, size);
+					if (cl->buf == NULL) {
+						ngx_log_error(NGX_LOG_ERR, ctx->log, 0,
+							"Alloc the space for the buf of form name failed");
+						return NGX_HTTP_INTERNAL_SERVER_ERROR;
 					}
+
+					cl->buf->pos = cl->buf->start;
+					cl->buf->last = cl->buf->pos + size;
+					cl->buf->last_in_chain = 0;
+					cl->buf->last_buf = 0;
+
+					(void) ngx_cpymem(cl->buf->pos, data->last_form_name_pos, size);
+
+					if (*s == '=') {
+						cl->buf->last_in_chain = 1;
+						cl->buf->last_buf = 1;
+					}
+
+					cl->next = NULL;
+
+					if (bd->field_name_chain == NULL) {
+						bd->field_name_chain = cl;
+						bd->current = bd->field_name_chain;
+					} else {
+						*bd->next = cl;
+						bd->current = *bd->next;
+					}
+
+					bd->next = &cl->next;
+				}
+
+				if (!data->log_content_purify) {
+					/* no need to decode, for it is the form name  */
+					if (*s == '=' && s != e) {
+						size += 1;
+					}
+
+					rc = ngx_http_log_collection_process_buffer_handler(ctx,
+						data->last_form_name_pos, size);
 
 					if (rc != NGX_OK) {
 						ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Failed to process form name");
 						return rc;
 					}
+				}
 
-					if (*s == '=' && s != e) {
+				if (*s == '=') {
+					data->form_state = log_collection_form_value;
+
+					if (s != e) {
 						data->last_form_value_pos = s + 1;
 					}
-
-					break;
 				}
+			}
+		} else {
+			if (*s == '=') {
+				ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Format is xx== or xx=yy=");
+				return NGX_LOG_COLLECTION_MALFORMED;
+			}
 
-				break;
-			case log_collection_form_value:
-				if (*s == '=') {
-					ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Format is xx=yy=");
-					return NGX_LOG_COLLECTION_MALFORMED;
-				}
+			if (*s == '&' || s == e) {
+				if (data->log_content_decode) {
+					purify_s = data->last_form_value_pos;
 
-				if (*s == '&' || s == e) {
-					/* form value ended */
-					if (*s == '&') {
-						data->form_state = log_collection_form_name;
-						data->form_name_flag = 0;
+					if (data->log_content_purify) {
+						purify_e = s;
+					} else {
+						/* +1: include '&' */
+						purify_e = (s == e) ? s : (s + 1);
 					}
 
-					if (data->log_content_decode) {
-						purify_s = data->last_form_value_pos;
+					rc = data->decode_output_buffer_handler(ctx, &purify_s, &purify_e);
 
-						if (data->log_content_purify) {
-							purify_e = s;
-						} else {
-							/* +1: include '&' */
-							purify_e = (s == e) ? s : (s + 1);
-						}
+					if (purify_s != data->last_form_value_pos) {
+						*start = purify_s;
+					}
 
-						rc = data->decode_output_buffer_handler(ctx, &purify_s, &purify_e);
-
-						if (purify_s != data->last_form_value_pos) {
-							*start = purify_s;
-						}
-
-						if (data->log_content_purify) {
-							if (purify_e != s) {
-								*end = purify_e;
-							}
-						} else {
-							if (s == e) {
-								if (purify_e != s) {
-									*end = purify_e;
-								}
-							} else {
-								if (purify_e != s + 1) {
-									*end = purify_e;
-								}
-							}
-						}
-
-						if (ctx->redirect_to_backend) {
-							val_size = purify_e - purify_s;
-
-							if (!data->log_content_purify) {
-								if (*s == '&' && s != e) {
-									/* we wrote a '&' */
-									val_size -= 1;
-								}
-							}
+					if (data->log_content_purify) {
+						if (purify_e != s) {
+							*end = purify_e;
 						}
 					} else {
-						size = s - data->last_form_value_pos;
-						/* exclude '&' */
-						val_size = size;
-
-						if (*s == '&' && s != e) {
-							if (!data->log_content_purify) {
-								/* for we will write '&' */
-								size += 1;
-							}
+						if ((s == e && purify_e != s) || (s != e && (purify_e != s + 1))) {
+							*end = purify_e;
 						}
-
-						rc = ngx_http_log_collection_process_buffer_handler(ctx,
-							data->last_form_value_pos, size);
 					}
+
+					if (ctx->redirect_to_backend) {
+						val_size = purify_e - purify_s;
+
+						if (!data->log_content_purify && *s == '&' && s != e) {
+							/* we wrote a '&' */
+							val_size -= 1;
+						}
+					}
+				} else {
+					size = s - data->last_form_value_pos;
+					/* exclude '&' */
+					val_size = size;
+
+					if (!data->log_content_purify && *s == '&' && s != e) {
+						/* for we will write '&' */
+						size += 1;
+					}
+
+					rc = ngx_http_log_collection_process_buffer_handler(ctx,
+						data->last_form_value_pos, size);
 
 					if (rc != NGX_OK) {
 						return rc;
 					}
-
-					if (ctx->redirect_to_backend) {
-						bd->text_len_n += (off_t) val_size;
-					}
 				}
 
-				if (*s == '&' && s != e) {
-					if (ctx->redirect_to_backend) {
-						rc = ngx_http_log_collection_construct_backend_request(ctx);
+				if (ctx->redirect_to_backend) {
+					bd->text_len_n += (off_t) val_size;
+				}
 
-						for (cl = bd->field_name_chain; cl; /* void */) {
-							ln = cl;
-							cl = cl->next;
+				/* form value ended */
+				if (*s == '&') {
+					data->form_state = log_collection_form_name;
+					data->form_name_flag = 0;
 
-							ngx_pfree(ctx->request->pool, ln->buf);
-							ngx_free_chain(ctx->request->pool, ln);
+					if (s != e) {
+						if (ctx->redirect_to_backend) {
+							rc = ngx_http_log_collection_construct_backend_request(ctx);
+
+							for (cl = bd->field_name_chain; cl; /* void */) {
+								ln = cl;
+								cl = cl->next;
+
+								ngx_pfree(ctx->request->pool, ln->buf);
+								ngx_free_chain(ctx->request->pool, ln);
+							}
+
+							bd->field_name_chain = NULL;
+							bd->next = &bd->field_name_chain;
+							bd->text_len_n = 0;
 						}
 
-						bd->field_name_chain = NULL;
-						bd->next = &bd->field_name_chain;
-						bd->text_len_n = 0;
+						data->last_form_name_pos = s + 1;
 					}
-					data->last_form_name_pos = s + 1;
 				}
+			}
 		}
 
 		++s;
@@ -1450,7 +1430,7 @@ ngx_http_log_collection_process_output_buffer_handler(ngx_http_log_collection_ct
  */
 static ngx_int_t
 ngx_http_log_collection_decode_output_buffer_handler(ngx_http_log_collection_ctx_t *ctx,
-			u_char **start, u_char **end)
+	u_char **start, u_char **end)
 {
 	ngx_int_t rc;
 	size_t l = 3;
@@ -2092,7 +2072,7 @@ ngx_http_read_log_collection_client_request_body(ngx_http_request_t *r, ngx_http
 #if defined nginx_version && nginx_version >= 1003009
 		&& !r->headers_in.chunked
 #endif
-			) {
+	) {
 		post_handler(r);
 		return ctx->output_status;
 	}
