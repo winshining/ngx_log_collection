@@ -28,8 +28,8 @@ Add backend processing.
 Code on 2011-07-29.
 
 Version 1.6:
-Fix bug: parse log_collection, add "cf->args->nelts == 3".
-Fix bug: if redirect_to_backend is 0, do not run script.
+Fix a bug: parse log_collection, add "cf->args->nelts == 3".
+Fix a bug: if redirect_to_backend is 0, do not run script.
 Code on 2011-08-10.
 
 Version 1.7:
@@ -87,4 +87,11 @@ Code on 2017-02-03.
 
 Optimize the code.
 Code on 2017-02-04.
+
+Version 2.6:
+Fix a bug: when finishing the request, subtract the connection's requests
+member, in order not to reach the max count of the pipeline requests on a
+connection(if so, nginx will close the connection by force).
+Optimize the code.
+Code on 2017-02-22.
 

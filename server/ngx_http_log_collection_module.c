@@ -1679,6 +1679,11 @@ ngx_http_log_collection_post_handler(ngx_http_request_t *r)
 	ngx_chain_t *out = NULL, **next = NULL;
 	ngx_http_log_collection_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_log_collection_module);
 
+        /* avoid to reach the max keepalive_requests */
+        if (r->connection->requests > 0) {
+            r->connection->requests--;
+        }
+
 	if (r->discard_body) {
 		return;
 	} else if (ctx->redirect_to_backend) {
@@ -2460,8 +2465,8 @@ ngx_http_log_collection(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 		return NGX_CONF_ERROR;
 	}
 
-	lclcf->log_collection_switch = (ngx_strncasecmp(value[1].data,
-		(u_char *) "on", sizeof((u_char *) "on") - 1) == 0) ? 1 : 0;
+	lclcf->log_collection_switch = ((value[1].len == sizeof((u_char *) "on") - 1) &&
+		ngx_strncasecmp(value[1].data, (u_char *) "on", sizeof((u_char *) "on") - 1) == 0) ? 1 : 0;
 
 	if (value[2].len != 0 && cf->args->nelts == 3) {
 		lclcf->redirect_to_backend = 1;

@@ -174,7 +174,7 @@ void* CHttpSocket::DoWork(void *arg)
 	int n;
 	char buffer[s_bufsize];
 	struct epoll_event events[2];
-	int count = 0;
+	// int count = 0;
 
 	CHttpSocket* obj = (CHttpSocket*) arg;
 	const string& reqh = obj->GetConnectionReqHeader();
@@ -280,14 +280,14 @@ void* CHttpSocket::DoWork(void *arg)
 							CHttpSocket::response_state s = obj->CheckResponse(string(buffer));
 							if (s == CHttpSocket::RESPONSE_DONE) {
 								delta = 0;
-
+/*
 								if (++count > 20) {
 									obj->ReInitialize();
 									obj->NonBlockConnect();
 									count = 0;
 								}
 
-								goto done;
+*/								goto done;
 							}
 						}
 					}
