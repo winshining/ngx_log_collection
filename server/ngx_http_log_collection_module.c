@@ -6,13 +6,9 @@
  * Copyright (C) 2011-2017 Nginx, Inc.
  */
 
-#include <ngx_config.h>
-#include <ngx_core.h>
-#include <ngx_http.h>
 #include <nginx.h>
+#include "ngx_http_log_collection_module.h"
 
-#define CLIENT_UUID_STRING			"Client-UUID" /* user defined */
-#define UUID_STRING_LENGTH			36
 #define IP_STRING_MAX_LENGTH		15
 #define CONTENT_TYPE_VALUE_STRING	"application/x-www-form-urlencoded"
 /*
@@ -66,30 +62,6 @@ typedef struct {
     ngx_array_t             *value_lengths;
     ngx_array_t             *value_values;
 } ngx_http_log_collection_field_template_t;
-
-/*
- * Log collection configuration for specific location
- */
-typedef struct ngx_http_log_collection_loc_conf_s {
-	/* for backend */
-	ngx_str_t	url;
-	ngx_http_complex_value_t *url_cv;
-
-	ngx_flag_t	all_in_single_folder;
-	ngx_flag_t	log_collection_switch;
-	ngx_flag_t	log_content_decode;
-	ngx_flag_t	log_content_purify;
-	ngx_flag_t	redirect_to_backend;
-	ngx_path_t	*store_path;
-	ngx_str_t	store_map_to_uri;
-
-	ngx_array_t	*field_templates; /* ngx_http_log_collection_field_template_t */
-	ngx_flag_t	forward_args;
-
-	off_t		max_file_size;
-	size_t		max_request_body_size;
-	size_t		upload_limit_rate;
-} ngx_http_log_collection_loc_conf_t;
 
 struct ngx_http_log_collection_ctx_s;
 
@@ -291,6 +263,14 @@ static ngx_command_t ngx_http_log_collection_commands[] = {
 		ngx_http_log_collection_set_form_field,
 		NGX_HTTP_LOC_CONF_OFFSET,
 		offsetof(ngx_http_log_collection_loc_conf_t, field_templates),
+		NULL
+	},
+	{
+		ngx_string("uuid_authen"),
+		NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2,
+		ngx_http_uuid_authen_create_shm_slab,
+		NGX_HTTP_LOC_CONF_OFFSET,
+		0,
 		NULL
 	},
 
@@ -802,7 +782,7 @@ ngx_http_log_collection_open_file(ngx_http_log_collection_ctx_t *ctx)
 		err = ngx_create_full_path(file->name.data, 0755);
 
 		if (err != 0) {
-			ngx_log_error(NGX_LOG_ERR, ctx->log, ngx_errno, "Fail to create path: %s", file->name.data);
+			ngx_log_error(NGX_LOG_ERR, ctx->log, ngx_errno, "Failed to create path: %s", file->name.data);
 			return NGX_LOG_COLLECTION_IOERROR;
 		}
 
@@ -818,7 +798,7 @@ ngx_http_log_collection_open_file(ngx_http_log_collection_ctx_t *ctx)
 	if (file->fd == NGX_INVALID_FILE) {
 		err = ngx_errno;
 
-		ngx_log_error(NGX_LOG_ERR, ctx->log, err, "Fail to create file: %s", file->name.data);
+		ngx_log_error(NGX_LOG_ERR, ctx->log, err, "Failed to create file: %s", file->name.data);
 		return NGX_LOG_COLLECTION_IOERROR;
 	}
 
@@ -1674,15 +1654,19 @@ ngx_http_log_collection_process_request_body(ngx_http_request_t *r, ngx_chain_t 
 static void
 ngx_http_log_collection_post_handler(ngx_http_request_t *r)
 {
-	ngx_int_t rc = NGX_OK;
-	ngx_buf_t *b;
-	ngx_chain_t *out = NULL, **next = NULL;
-	ngx_http_log_collection_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_log_collection_module);
+	ngx_int_t						rc = NGX_OK;
+	ngx_buf_t						*b;
+	ngx_chain_t						*out = NULL, **next = NULL;
+	ngx_http_log_collection_ctx_t	*ctx;
+
+	ctx = ngx_http_get_module_ctx(r, ngx_http_log_collection_module);
 
 	/* avoid to reach the max keepalive_requests */
 	if (r->connection->requests > 0) {
 		r->connection->requests--;
 	}
+
+	ngx_http_uuid_authen_shm_slab_expire(r, &ctx->client_uuid);
 
 	if (r->discard_body) {
 		return;
@@ -2206,45 +2190,9 @@ done:
  * Find user defined header
  */
 static ngx_int_t
-ngx_http_log_collection_find_special_header(ngx_http_log_collection_ctx_t *ctx, ngx_str_t *h)
+ngx_http_log_collection_find_special_header(ngx_http_request_t *r, ngx_str_t *uuid)
 {
-	ngx_uint_t i;
-	ngx_list_part_t *part = &ctx->request->headers_in.headers.part;
-	ngx_table_elt_t *header = part->elts;
-
-	for (i = 0; /* void */; i++) {
-		if (i >= part->nelts) {
-			if (part->next == NULL) {
-				break;
-			}
-
-			part = part->next;
-			header = part->elts;
-			i = 0;
-		}
-
-		if (header[i].hash == 0) {
-			continue;
-		}
-
-		if (ngx_strncasecmp(header[i].key.data,	h->data, h->len) == 0) {
-			ctx->client_uuid = header[i].value;
-
-			if (ctx->client_uuid.len != UUID_STRING_LENGTH
-				|| ctx->client_uuid.data[8] != '-'
-				|| ctx->client_uuid.data[13] != '-'
-				|| ctx->client_uuid.data[18] != '-'
-				|| ctx->client_uuid.data[23] != '-')
-			{
-				ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Invalid UUID format: %V", &ctx->client_uuid);
-				return NGX_ERROR;
-			}
-
-			return NGX_OK;
-		}
-	}
-
-	return NGX_ERROR;
+	return ngx_http_uuid_authen_handler(r, uuid);
 }
 
 /*
@@ -2265,7 +2213,6 @@ ngx_http_log_collection_parse_request_headers(ngx_http_log_collection_ctx_t *ctx
 	ngx_http_headers_in_t *headers_in)
 {
 	ngx_str_t *content_type;
-	ngx_str_t to_find_str;
 	ngx_int_t rc, err;
 	ngx_http_log_collection_loc_conf_t *lclcf = ngx_http_get_module_loc_conf(ctx->request,
 			ngx_http_log_collection_module);
@@ -2289,14 +2236,12 @@ ngx_http_log_collection_parse_request_headers(ngx_http_log_collection_ctx_t *ctx
 		goto failed;
 	}
 
-	to_find_str.data = (u_char *) CLIENT_UUID_STRING;
-	to_find_str.len = sizeof(CLIENT_UUID_STRING) - 1;
-	rc = ngx_http_log_collection_find_special_header(ctx, &to_find_str);
+	rc = ngx_http_log_collection_find_special_header(ctx->request, &ctx->client_uuid);
 
-	if (rc != NGX_OK) {
-		ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Missing Client-UUID header");
+	if (rc != NGX_DECLINED) {
+		ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Client-UUID header missing or conflicted");
 
-		err = NGX_HTTP_BAD_REQUEST;
+		err = rc;
 		goto failed;
 	}
 

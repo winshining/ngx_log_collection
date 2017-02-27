@@ -95,3 +95,7 @@ connection(if so, nginx will close the connection by force).
 Optimize the code.
 Code on 2017-02-22.
 
+Version 2.7:
+Add a new branch and in which add UUID authentication functionality.
+Code on 2017-02-27.
+
