@@ -101,7 +101,6 @@ ngx_http_uuid_authen_handler(ngx_http_request_t *r, ngx_str_t *uuid)
 	ngx_http_log_collection_loc_conf_t	*conf;
 
 	conf = ngx_http_get_module_loc_conf(r, ngx_http_log_collection_module);
-	rc = NGX_DECLINED;
 
 	if (r == NULL || uuid == NULL) {
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -126,7 +125,7 @@ ngx_http_uuid_authen_handler(ngx_http_request_t *r, ngx_str_t *uuid)
 		}
 
 		if (ngx_strncasecmp(header[i].key.data,	(u_char *) CLIENT_UUID_STRING,
-			sizeof(CLIENT_UUID_STRING) - 1) == 0)
+			ngx_strlen(CLIENT_UUID_STRING)) == 0)
 		{
 			uuid->data = header[i].value.data;
 			uuid->len = header[i].value.len;
@@ -151,7 +150,7 @@ ngx_http_uuid_authen_handler(ngx_http_request_t *r, ngx_str_t *uuid)
 	}
 
 	if (conf->uuid_authen_conf.authen_switch == 0) {
-		return rc;
+		return NGX_DECLINED;
 	}
 
 	hash = ngx_crc32_short(uuid->data, uuid->len);
@@ -160,21 +159,33 @@ ngx_http_uuid_authen_handler(ngx_http_request_t *r, ngx_str_t *uuid)
 
 	node = ngx_str_rbtree_lookup(&conf->uuid_authen_conf.sh->rbtree, uuid, hash);
 	if (node) {
-		rc = NGX_HTTP_FORBIDDEN;
+		if (r->pipeline) {
+			ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "It is a pipelined request");
+
+			rc = NGX_DECLINED;
+		} else {
+			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "An uuid \"%V\" exists", uuid);
+
+			rc = NGX_HTTP_FORBIDDEN;
+		}
 	} else {
 		/* insert the uuid into the rbtree */
-		len = sizeof(ngx_str_node_t) + UUID_STRING_LENGTH;
+		len = sizeof(ngx_str_node_t) + UUID_STRING_LENGTH - 1;
 		new = ngx_slab_alloc_locked(conf->uuid_authen_conf.shpool, len);
 		if (new == NULL) {
-			return NGX_HTTP_FORBIDDEN;
+			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+					"Allocation for the node of uuid \"%V\" failed", uuid);
+
+			rc = NGX_HTTP_FORBIDDEN;
+		} else {
+			ngx_memcpy(new->data, uuid->data, UUID_STRING_LENGTH);
+			new->str_node.node.key = hash;
+			new->str_node.str.data = new->data;
+			new->str_node.str.len = ngx_strlen(new->data);
+			ngx_rbtree_insert(&conf->uuid_authen_conf.sh->rbtree, &new->str_node.node);
+
+			rc = NGX_DECLINED;
 		}
-
-		ngx_memcpy(new->data, uuid->data, UUID_STRING_LENGTH);
-		new->str_node.node.key = hash;
-		new->str_node.str.data = new->data;
-		new->str_node.str.len = ngx_strlen(new->data);
-
-		ngx_rbtree_insert(&conf->uuid_authen_conf.sh->rbtree, &new->str_node.node);
 	}
 
 	ngx_shmtx_unlock(&conf->uuid_authen_conf.shpool->mutex);
@@ -183,7 +194,7 @@ ngx_http_uuid_authen_handler(ngx_http_request_t *r, ngx_str_t *uuid)
 }
 
 void
-ngx_http_uuid_authen_shm_slab_expire(ngx_http_request_t *r, ngx_str_t *uuid)
+ngx_http_uuid_authen_expire(ngx_http_request_t *r, ngx_str_t *uuid)
 {
 	uint32_t		hash;
 	ngx_str_node_t	*node;
@@ -194,18 +205,19 @@ ngx_http_uuid_authen_shm_slab_expire(ngx_http_request_t *r, ngx_str_t *uuid)
 	}
 	
 	lclcf = ngx_http_get_module_loc_conf(r, ngx_http_log_collection_module);
-	if (lclcf->uuid_authen_conf.authen_switch == 0) {
-		ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "Shared memory not exist.");
-		return;
+
+	ngx_shmtx_lock(&lclcf->uuid_authen_conf.shpool->mutex);
+
+	if (lclcf->uuid_authen_conf.authen_switch) {
+		hash = ngx_crc32_short(uuid->data, uuid->len);
+		node = ngx_str_rbtree_lookup(&lclcf->uuid_authen_conf.sh->rbtree, uuid, hash);
+
+		if (node) {
+			ngx_rbtree_delete(&lclcf->uuid_authen_conf.sh->rbtree, &node->node);
+			ngx_slab_free_locked(lclcf->uuid_authen_conf.shpool, (void *) node);
+		}
 	}
 
-	hash = ngx_crc32_short(uuid->data, uuid->len);
-	node = ngx_str_rbtree_lookup(&lclcf->uuid_authen_conf.sh->rbtree, uuid, hash);
-	if (node == NULL) {
-		return;
-	}
-
-	ngx_rbtree_delete(&lclcf->uuid_authen_conf.sh->rbtree, &node->node);
-	ngx_slab_free_locked(lclcf->uuid_authen_conf.shpool, (void *) node);
+	ngx_shmtx_unlock(&lclcf->uuid_authen_conf.shpool->mutex);
 }
 

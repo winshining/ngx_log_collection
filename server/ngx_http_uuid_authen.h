@@ -41,7 +41,7 @@ char *
 ngx_http_uuid_authen_create_shm_slab(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
 void
-ngx_http_uuid_authen_shm_slab_expire(ngx_http_request_t *r, ngx_str_t *uuid);
+ngx_http_uuid_authen_expire(ngx_http_request_t *r, ngx_str_t *uuid);
 
 #endif
 

@@ -99,3 +99,8 @@ Version 2.7:
 Add a new branch and in which add UUID authentication functionality.
 Code on 2017-02-27.
 
+Version 2.8:
+Add a new functionality that supports pipeline processing.
+Recode the C++ testing client.
+Code on 2017-03-02.
+

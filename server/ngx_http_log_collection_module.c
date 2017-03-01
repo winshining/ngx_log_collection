@@ -1666,7 +1666,10 @@ ngx_http_log_collection_post_handler(ngx_http_request_t *r)
 		r->connection->requests--;
 	}
 
-	ngx_http_uuid_authen_shm_slab_expire(r, &ctx->client_uuid);
+	if (r->header_in->pos == r->header_in->last) {
+		/* not pipelined request */
+		ngx_http_uuid_authen_expire(r, &ctx->client_uuid);
+	}
 
 	if (r->discard_body) {
 		return;
@@ -1804,9 +1807,12 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 	ngx_int_t						rc;
 	ngx_http_core_loc_conf_t		*clcf;
 	ngx_msec_t						delay;
-	ngx_http_log_collection_ctx_t	*ctx = ngx_http_get_module_ctx(r, ngx_http_log_collection_module);
+	ngx_http_log_collection_ctx_t	*ctx;
 	off_t							rest = 0;
 	ngx_chain_t						out;
+
+	ctx = ngx_http_get_module_ctx(r, ngx_http_log_collection_module);
+	clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
 	c = r->connection;
 	rb = r->request_body;
@@ -1839,7 +1845,7 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 			size = rb->buf->end - rb->buf->last;
 			rest = rb->rest - (rb->buf->last - rb->buf->pos);
 
-			if ((off_t)size > rest) {
+			if ((off_t) size > rest) {
 				size = (size_t) rest;
 			}
 
@@ -1916,7 +1922,6 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 		}
 
 		if (!c->read->ready) {
-			clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 			ngx_add_timer(c->read, clcf->client_body_timeout);
 
 			if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
@@ -1927,18 +1932,28 @@ ngx_http_do_read_log_collection_client_request_body(ngx_http_request_t *r)
 		}
 	}
 
-	if (c->read->timer_set) {
-		ngx_del_timer(c->read);
-	}
+	if (!r->pipeline) {
+		if (c->read->timer_set) {
+			ngx_del_timer(c->read);
+		}
 
-	/* For we finished reading client request body,
-	 * we need not read data any more, so block it.
-	 */
-	r->read_event_handler = ngx_http_block_reading;
+		/* For we finished reading client request body,
+		 * we need not read data any more, so block it.
+		 */
+		r->read_event_handler = ngx_http_block_reading;
+	} else {
+		if (!c->read->ready) {
+			ngx_add_timer(c->read, clcf->client_body_timeout);
+
+			if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+				return NGX_HTTP_INTERNAL_SERVER_ERROR;
+			}
+		}
+	}
 
 	rb->post_handler(r);
 
-	return ctx->output_status;
+	return r->pipeline ? NGX_AGAIN : ctx->output_status;
 
 failed:
 	switch(rc) {
@@ -1967,8 +1982,11 @@ ngx_http_read_log_collection_client_request_body_handler(ngx_http_request_t *r)
 	ngx_int_t					rc;
 	ngx_event_t					*rev = r->connection->read;
 	ngx_http_core_loc_conf_t	*clcf;
-	ngx_http_log_collection_ctx_t *ctx = ngx_http_get_module_ctx(r,
-				ngx_http_log_collection_module);
+	ngx_http_log_collection_ctx_t *ctx;
+	
+	rev = r->connection->read;
+	ctx = ngx_http_get_module_ctx(r, ngx_http_log_collection_module);
+	clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
 	if (rev->timedout) {
 		if(!rev->delayed) {
@@ -1982,7 +2000,6 @@ ngx_http_read_log_collection_client_request_body_handler(ngx_http_request_t *r)
 		rev->delayed = 0;
 
 		if (!rev->ready) {
-			clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 			ngx_add_timer(rev, clcf->client_body_timeout);
 
 			if (ngx_handle_read_event(rev, clcf->send_lowat) != NGX_OK) {
@@ -1994,7 +2011,6 @@ ngx_http_read_log_collection_client_request_body_handler(ngx_http_request_t *r)
 		}
 	} else {
 		if (r->connection->read->delayed) {
-			clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 			ngx_log_debug0(NGX_LOG_DEBUG_HTTP, rev->log, 0, "Http read delayed");
 
 			if (ngx_handle_read_event(rev, clcf->send_lowat) != NGX_OK) {
@@ -2153,7 +2169,8 @@ ngx_http_read_log_collection_client_request_body(ngx_http_request_t *r, ngx_http
 #if defined nginx_version && nginx_version >= 1003009
 		!r->headers_in.chunked &&
 #endif
-		rb->rest < (off_t) size) {
+		rb->rest < (off_t) size)
+	{
 		size = (ssize_t) rb->rest;
 
 		if (r->request_body_in_single_buf) {
@@ -2239,7 +2256,11 @@ ngx_http_log_collection_parse_request_headers(ngx_http_log_collection_ctx_t *ctx
 	rc = ngx_http_log_collection_find_special_header(ctx->request, &ctx->client_uuid);
 
 	if (rc != NGX_DECLINED) {
-		ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Client-UUID header missing or conflicted");
+		if (rc == NGX_HTTP_FORBIDDEN) {
+			ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Client-UUID header conflicted");
+		} else {
+			ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Client-UUID header missing");
+		}
 
 		err = rc;
 		goto failed;
