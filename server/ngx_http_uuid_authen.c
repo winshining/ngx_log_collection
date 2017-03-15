@@ -204,9 +204,9 @@ ngx_http_uuid_authen_expire(ngx_http_request_t *r, ngx_str_t *uuid)
 		return;
 	}
 
-	if (lclcf->uuid_authen_conf.authen_switch) {
-		lclcf = ngx_http_get_module_loc_conf(r, ngx_http_log_collection_module);
+	lclcf = ngx_http_get_module_loc_conf(r, ngx_http_log_collection_module);
 
+	if (lclcf->uuid_authen_conf.authen_switch) {
 		ngx_shmtx_lock(&lclcf->uuid_authen_conf.shpool->mutex);
 
 		hash = ngx_crc32_short(uuid->data, uuid->len);
