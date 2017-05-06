@@ -802,6 +802,8 @@ ngx_http_log_collection_open_file(ngx_http_log_collection_ctx_t *ctx)
 		return NGX_LOG_COLLECTION_IOERROR;
 	}
 
+	file->log = ctx->log;
+
 	if (ngx_fd_info(file->fd, &file->info) == -1) {
 		err = ngx_errno;
 

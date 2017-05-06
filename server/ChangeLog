@@ -104,3 +104,7 @@ Add a new functionality that supports pipeline processing.
 Recode the C++ testing client.
 Code on 2017-03-02.
 
+Fix a bug: when compiled with parameter "--with-debug", it will crash when
+writing the received log to the file.
+Code on 2017-05-06.
+
