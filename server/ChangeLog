@@ -106,5 +106,7 @@ Code on 2017-03-02.
 
 Fix a bug: when compiled with parameter "--with-debug", it will crash when
 writing the received log to the file.
+Fix a bug: add the unlock when processing a wrong case.
+Add a wrong form data processing.
 Code on 2017-05-06.
 
