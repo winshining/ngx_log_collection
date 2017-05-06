@@ -1210,7 +1210,7 @@ ngx_http_log_collection_process_output_buffer_handler(ngx_http_log_collection_ct
 			if (s == const_s) {
 				if (!data->form_name_flag) {
 					if (*s == '=') {
-						ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Format is =xx in the single buffer");
+						ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Format is =xx in the single buffer or &= in the two buffers");
 						return NGX_LOG_COLLECTION_MALFORMED;
 					}
 
@@ -1219,6 +1219,11 @@ ngx_http_log_collection_process_output_buffer_handler(ngx_http_log_collection_ct
 					if (ctx->redirect_to_backend) {
 						bd->text_len_n = 0;
 					}
+				}
+			} else {
+				if (*(s - 1) == '&' && *s == '=') {
+					ngx_log_error(NGX_LOG_ERR, ctx->log, 0, "Format is &= in the single buffer");
+					return NGX_LOG_COLLECTION_MALFORMED;
 				}
 			}
 
@@ -2401,6 +2406,7 @@ ngx_http_log_collection_handler(ngx_http_request_t *r)
 	rc = ngx_http_read_log_collection_client_request_body(r, ngx_http_log_collection_post_handler);
 
 	if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+		ngx_http_uuid_authen_expire(r, &ctx->client_uuid);
 		return rc;
 	}
 
